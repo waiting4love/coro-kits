@@ -14,9 +14,9 @@
 //     framing is recomputed on this side)
 //   - Streaming exchange: an ExchangeHandler (interface) receives the
 //     headers on arrival (may commit client response headers, e.g. for
-//     SSE), gets body chunks one by one; business exceptions propagate
-//     untouched. Upstream URL and request assembly are entirely the
-//     caller's business.
+//     SSE), gets body chunks one by one, plus lifecycle hooks (afterBody
+//     epilogue / onHardCap abort); business exceptions propagate untouched.
+//     Upstream URL and request assembly are entirely the caller's business.
 //
 // Timeout model (mirrors Node's AbortController plus a body-stage anti-hang
 // guard):
@@ -51,12 +51,10 @@
 
 #include <chrono>
 #include <cstddef>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 #include "http.hpp"
@@ -80,34 +78,36 @@ bool hopByHop(std::string_view name);
 
 class HttpClient {
 public:
-    // Streaming exchange handler contract: the implementation must outlive
-    // the exchange (passed by reference, non-owning)
+    // Streaming exchange handler: the event contract of one exchange. The
+    // implementation must outlive the exchange (passed by reference,
+    // non-owning). Happy-path order: onHeader -> onBody* -> afterBody;
+    // onHardCap fires only on the abort path (totalCap expiry), after which
+    // the exchange fails with 504 and afterBody is skipped.
     struct ExchangeHandler {
         virtual ~ExchangeHandler() = default;
 
-        // Called once when the response headers arrive (before the body);
-        // returns the rolling idle timeout for the body stage (nullopt =
-        // unlimited, totalCap is the safety net). May commit client
-        // response headers here, or throw a business exception to abort
-        // the exchange
+        // Response headers arrived (before the body); returns the rolling
+        // idle timeout for the body stage (nullopt = unlimited, totalCap is
+        // the safety net). May commit client response headers here, or
+        // throw a business exception to abort the exchange
         virtual asio::awaitable<std::optional<std::chrono::milliseconds>>
         onHeader(http::response_parser<http::buffer_body>& p) = 0;
 
-        // Called per non-empty body chunk; may throw a business exception
-        // to abort the exchange
+        // One non-empty body chunk; may throw a business exception to abort
+        // the exchange
         virtual asio::awaitable<void> onBody(const char* data, size_t n) = 0;
-    };
 
-    struct StreamOptions {
-        // On the hard cap firing, connections to tear down in addition to
-        // the upstream one (with SSE headers already committed, the client
-        // socket goes too; other paths keep it so a 504 can be sent). May
-        // be empty; captured objects must outlive the exchange
-        std::function<void()> onHardCap;
-        // Called after the body pump and before disarming the hard cap
-        // (SSE: ctx.endStream() - the last-chunk write stays inside the
-        // cap, guarding against a zero-window client deadlock). May be empty
-        std::function<asio::awaitable<void>()> afterBody;
+        // Body fully pumped, before the hard cap is disarmed (SSE: the
+        // last-chunk write stays under the cap, guarding against a
+        // zero-window client deadlock). Default: no-op
+        virtual asio::awaitable<void> afterBody() { co_return; }
+
+        // The hard overall cap fired: the upstream socket is already being
+        // force-closed; tear down anything else that must go with it (e.g.
+        // the client socket once SSE headers are committed; keep it
+        // otherwise so a 504 can still be sent). Called synchronously from
+        // a timer completion handler - must not throw. Default: no-op
+        virtual void onHardCap() {}
     };
 
     HttpClient();                        // Impl assembly lives in http_client.cpp
@@ -122,9 +122,9 @@ public:
     void setTotalCap(std::chrono::milliseconds v);       // hard overall cap; <=0 disables
     void setMaxBodyBytes(size_t v);                      // buffered-path memory guard
 
-    // Streaming exchange (handler contract: ExchangeHandler; option semantics: StreamOptions)
+    // Streaming exchange (event contract: ExchangeHandler)
     asio::awaitable<void> exchange(const ParsedUrl& u, http::request<http::string_body> req,
-                                   StreamOptions opt, ExchangeHandler& handler);
+                                   ExchangeHandler& handler);
 
     // ---- buffered (defined in http_client.cpp; keeps this header lean) ----
 

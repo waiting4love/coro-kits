@@ -125,7 +125,7 @@ public:
     size_t maxBodyBytes = 8ULL * 1024 * 1024;        // buffered-path memory guard
 
     asio::awaitable<void> exchange(const ParsedUrl& u, http::request<http::string_body> req,
-                                   StreamOptions opt, ExchangeHandler& handler) {
+                                   ExchangeHandler& handler) {
         auto ex = co_await asio::this_coro::executor;
 
         asio::steady_timer reaper(ex);
@@ -133,7 +133,7 @@ public:
         auto arm = [&](auto& upstream) {
             if (totalCap <= std::chrono::milliseconds(0)) return;
             reaper.expires_after(totalCap);
-            armReaper(reaper, upstream, capped, opt.onHardCap);
+            armReaper(reaper, upstream, capped, handler);
         };
 
         // resolve+connect (+TLS handshake) + request write + response-header
@@ -154,13 +154,13 @@ public:
                                                                          asio::use_awaitable);
                 co_await upstream.async_handshake(asio::ssl::stream_base::client,
                                                   asio::use_awaitable);
-                co_await requestAndRelay(upstream, req, handler, opt, reaper);
+                co_await requestAndRelay(upstream, req, handler, reaper);
             } else {
                 beast::tcp_stream upstream(ex);
                 arm(upstream);
                 upstream.expires_after(connectTimeout);
                 co_await upstream.async_connect(endpoints, asio::use_awaitable);
-                co_await requestAndRelay(upstream, req, handler, opt, reaper);
+                co_await requestAndRelay(upstream, req, handler, reaper);
             }
         } catch (const boost::system::system_error& e) {
             // Single exit for system_error from every stage (connect/request/
@@ -210,9 +210,8 @@ public:
         req.keep_alive(false); // one request per connection (no upstream pooling)
         req.prepare_payload();
 
-        BufferedHandler handler{maxBodyBytes};
-        StreamOptions opt; // buffered: no client connection to tear down, no finishing coroutine
-        co_await exchange(*u, std::move(req), std::move(opt), handler);
+        BufferedHandler handler{maxBodyBytes}; // buffered: the default afterBody/onHardCap no-ops apply
+        co_await exchange(*u, std::move(req), handler);
 
         http::response<http::string_body> res{http::status(handler.status), handler.version};
         for (const auto& [k, v] : handler.headers) res.insert(k, v);
@@ -257,12 +256,12 @@ private:
     // already be gone, so check ec before touching any reference
     template <class Stream>
     static void armReaper(asio::steady_timer& timer, Stream& upstream, bool& capped,
-                          const std::function<void()>& onHardCap) {
-        timer.async_wait([&upstream, &capped, &onHardCap](const boost::system::error_code& ec) {
+                          ExchangeHandler& handler) {
+        timer.async_wait([&upstream, &capped, &handler](const boost::system::error_code& ec) {
             if (ec) return;
             capped = true;
             beast::get_lowest_layer(upstream).close();
-            if (onHardCap) onHardCap();
+            handler.onHardCap(); // synchronous, from a completion handler: must not throw
         });
     }
 
@@ -300,7 +299,6 @@ private:
     static asio::awaitable<void> requestAndRelay(Stream& upstream,
                                                  http::request<http::string_body>& req,
                                                  ExchangeHandler& handler,
-                                                 const StreamOptions& opt,
                                                  asio::steady_timer& reaper) {
         co_await http::async_write(upstream, req, asio::use_awaitable);
 
@@ -314,7 +312,7 @@ private:
         auto idle = co_await handler.onHeader(p);
         beast::get_lowest_layer(upstream).expires_never();
         co_await pumpBody(upstream, left, p, handler, idle);
-        if (opt.afterBody) co_await opt.afterBody();
+        co_await handler.afterBody(); // no-op unless overridden
         reaper.cancel(); // normal finish disarms the cap (later aborted callbacks only check ec, touching no references)
     }
 
@@ -335,8 +333,8 @@ void HttpClient::setMaxBodyBytes(size_t v) { impl_->maxBodyBytes = v; }
 
 asio::awaitable<void> HttpClient::exchange(const ParsedUrl& u,
                                            http::request<http::string_body> req,
-                                           StreamOptions opt, ExchangeHandler& handler) {
-    return impl_->exchange(u, std::move(req), std::move(opt), handler);
+                                           ExchangeHandler& handler) {
+    return impl_->exchange(u, std::move(req), handler);
 }
 
 asio::awaitable<http::response<http::string_body>> HttpClient::get(const std::string& url) {

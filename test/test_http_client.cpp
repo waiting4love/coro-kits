@@ -91,6 +91,46 @@ auto statusOf(HttpClient& hc, std::string url) {
     };
 }
 
+// Makes the four-event handler contract observable: records every
+// onHeader/onBody/afterBody/onHardCap invocation
+struct RecordingHandler : HttpClient::ExchangeHandler {
+    std::string body;
+    int status = 0;
+    int headers = 0;
+    int chunks = 0;
+    int afterBodies = 0;
+    int hardCaps = 0;
+
+    asio::awaitable<std::optional<std::chrono::milliseconds>>
+    onHeader(http::response_parser<http::buffer_body>& p) override {
+        ++headers;
+        status = (int)p.get().result_int();
+        co_return std::nullopt; // no idle timeout needed here
+    }
+
+    asio::awaitable<void> onBody(const char* data, size_t n) override {
+        ++chunks;
+        body.append(data, n);
+        co_return;
+    }
+
+    asio::awaitable<void> afterBody() override {
+        ++afterBodies;
+        co_return;
+    }
+
+    void onHardCap() override { ++hardCaps; }
+};
+
+// Minimal GET request for exchange() against the test server
+http::request<http::string_body> getRequest(const ParsedUrl& u) {
+    http::request<http::string_body> req{http::verb::get, u.target, 11};
+    req.set(http::field::host, u.hostHeader);
+    req.set(http::field::user_agent, "corokit-test");
+    req.prepare_payload();
+    return req;
+}
+
 TEST(HttpClientParseUrlTest, HttpsAndHttp) {
     auto u = parseUrl("https://api.example.com/v1/chat?x=1");
     ASSERT_TRUE(u);
@@ -159,7 +199,7 @@ TEST(HttpClientTest, PostEchoesBodyAndContentType) {
     srv.start();
 
     HttpClient hc;
-    auto call = [&hc, base = srv.baseUrl()]
+    auto call = [&hc, base = srv.baseUrl()]()
                     -> asio::awaitable<http::response<http::string_body>> {
         co_return co_await hc.post(base + "/echo", R"({"a":1})", "application/json");
     };
@@ -200,7 +240,7 @@ TEST(HttpClientTest, StripsHopByHopHeaders) {
     srv.start();
 
     HttpClient hc;
-    auto call = [&hc, base = srv.baseUrl()]
+    auto call = [&hc, base = srv.baseUrl()]()
                     -> asio::awaitable<http::response<http::string_body>> {
         co_return co_await hc.get(base + "/hop");
     };
@@ -245,6 +285,65 @@ TEST(HttpClientTest, ShellMoveDuringFlight) {
         co_return co_await movedTo.get(base + "/plain");
     });
     EXPECT_EQ(second.body(), "again"); // the destination owns the same Impl and can keep issuing requests
+}
+
+TEST(HttpClientTest, StreamingExchangeHappyPathEvents) {
+    // happy-path order: onHeader once -> onBody per chunk -> afterBody
+    // exactly once; onHardCap never fires
+    TestServer srv;
+    srv.router.add(http::verb::get, "/stream", [](Ctx& ctx) -> asio::awaitable<void> {
+        ctx.res.set(http::field::content_type, "text/plain");
+        ctx.res.body() = "hello streaming world";
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<std::string> {
+        RecordingHandler h; // lives in this frame, outliving the exchange it is passed to
+        auto u = parseUrl(base + "/stream");
+        if (!u) throwHttp(500, "bad url");
+        co_await hc.exchange(*u, getRequest(*u), h);
+        EXPECT_EQ(h.headers, 1);
+        EXPECT_EQ(h.status, 200);
+        EXPECT_GT(h.chunks, 0);
+        EXPECT_EQ(h.afterBodies, 1);
+        EXPECT_EQ(h.hardCaps, 0);
+        co_return h.body;
+    };
+    EXPECT_EQ(srv.run(call), "hello streaming world");
+}
+
+TEST(HttpClientTest, StreamingExchangeHardCapAborts) {
+    // abort path: totalCap fires -> onHardCap runs (before the 504
+    // surfaces); afterBody is skipped
+    TestServer srv;
+    srv.router.add(http::verb::get, "/hang", [](Ctx& ctx) -> asio::awaitable<void> {
+        (void)ctx;
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        timer.expires_after(2s); // far beyond totalCap: the hard cap force-closes
+        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        ctx.json(200, json::object{{"ok", true}});
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    hc.setTotalCap(50ms);
+    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<int> {
+        RecordingHandler h;
+        auto u = parseUrl(base + "/hang");
+        if (!u) throwHttp(500, "bad url");
+        try {
+            co_await hc.exchange(*u, getRequest(*u), h);
+            co_return 0;
+        } catch (const HttpError& e) {
+            EXPECT_EQ(h.hardCaps, 1);    // fired before the 504 surfaced
+            EXPECT_EQ(h.afterBodies, 0); // abort path skips the epilogue
+            co_return e.status;
+        }
+    };
+    EXPECT_EQ(srv.run(call), 504);
 }
 
 TEST(HttpClientTest, MaxBodyBytesGuard) {
