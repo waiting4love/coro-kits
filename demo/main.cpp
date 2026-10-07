@@ -135,7 +135,13 @@ int main() {
         asio::ip::tcp::acceptor acceptor(ioc, {asio::ip::make_address("127.0.0.1"), port});
         app->selfBase = "http://127.0.0.1:" + std::to_string(acceptor.local_endpoint().port());
 
-        asio::co_spawn(ioc, listen(std::move(acceptor), router, HttpConfig{}), asio::detached);
+        // listen() takes config by reference and the awaitable is lazy: the
+        // referenced object must outlive ioc.run(). A temporary (HttpConfig{})
+        // dies with the co_spawn full-expression and dangles inside the
+        // coroutine frame - that crashed on GCC/Linux while silently passing
+        // on Windows/clang
+        HttpConfig cfg;
+        asio::co_spawn(ioc, listen(std::move(acceptor), router, cfg), asio::detached);
 
         asio::signal_set signals(ioc, SIGINT, SIGTERM);
         signals.async_wait([&ioc](const boost::system::error_code&, int sig) {

@@ -10,9 +10,10 @@
 #   OpenSSL::SSL / OpenSSL::Crypto - the find_package(OpenSSL) result; a
 #                                    consumer on LibreSSL just creates these
 #                                    aliases itself (see examples/consumer)
-#   Boost::json (+ Boost::headers) - find_package(Boost COMPONENTS json) or
-#                                    a Boost superproject via FetchContent;
-#                                    1.81+ recommended (Boost.URL line)
+#   Boost::json + Boost::url      - find_package(Boost COMPONENTS json url)
+#                                    or a Boost superproject via FetchContent;
+#                                    1.81+ required (Boost.URL line); url is
+#                                    a compiled library, not header-only
 #   SQLite::SQLite3 or sqlite3     - find_package(SQLite3) or a self-built
 #                                    amalgamation target
 #
@@ -68,7 +69,9 @@ if(NOT TARGET OpenSSL::SSL)
 endif()
 
 if(NOT TARGET Boost::json)
-  find_package(Boost REQUIRED COMPONENTS json)
+  # url is a compiled library since Boost 1.81 (Boost.URL's iterator/params
+  # implementations live in libboost_url), not header-only
+  find_package(Boost REQUIRED COMPONENTS json url)
 endif()
 # Boost header aggregation: for an installed Boost or FindBoost,
 # Boost::headers is the full include set; but inside a Boost superproject

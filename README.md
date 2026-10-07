@@ -43,7 +43,7 @@ target_link_libraries(your-app PRIVATE corokit::corokit)
 | 库需要的 target | 回退解析 | 说明 |
 |---|---|---|
 | `OpenSSL::SSL` / `OpenSSL::Crypto` | `find_package(OpenSSL)` | **OpenSSL 与 LibreSSL 均可**：走 LibreSSL 的工程自建这对别名即可（`examples/consumer` 有先例） |
-| `Boost::json`（连带 `Boost::headers`） | `find_package(Boost COMPONENTS json)` | 建议 ≥ 1.81（Boost.URL 引入线），已测 1.87；超级项目 FetchContent 与系统安装皆可 |
+| `Boost::json` + `Boost::url` | `find_package(Boost COMPONENTS json url)` | ≥ 1.81（Boost.URL 引入线），已测 1.83 与 1.87；url 是编译库（非 header-only），超级项目 FetchContent 与系统安装皆可 |
 | `Boost::url`（可选） | — | Boost ≥ 1.87 存在可编译 URL target 时自动链接，与使用方对齐 `BOOST_URL_*` 宏，避免头/库混用 ODR |
 | `SQLite::SQLite3` 或 `sqlite3` | `find_package(SQLite3)` | amalgamation 自建 target（名字 `sqlite3`）或系统安装皆可 |
 

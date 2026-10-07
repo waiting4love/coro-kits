@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <span>
 
@@ -110,14 +111,18 @@ void applyCors(const HttpConfig& config, http::response<http::string_body>& res)
     res.set(http::field::access_control_allow_headers, config.corsAllowHeaders);
 }
 
-// Reads a whole file asynchronously (asio::stream_file). Open failure
-// (missing/unreadable...) -> nullopt, the same semantics as the old ifstream;
-// EOF arrives as error::eof by convention (caught via as_tuple, the bytes
-// read are still valid, and truncation shortens the result as before)
+// Reads a whole file. Open failure (missing/unreadable...) -> nullopt.
+// With async file support (asio gates stream_file behind BOOST_ASIO_HAS_FILE,
+// e.g. Windows or Linux with io_uring) the read is asynchronous; EOF arrives
+// as error::eof by convention (caught via as_tuple, the bytes read are still
+// valid, and truncation shortens the result). Without it, a synchronous
+// ifstream read - same semantics, briefly blocking the single-threaded loop
+// for a static file, matching the pre-stream_file behavior.
 asio::awaitable<std::optional<std::string>> readFileAsync(const std::string& path) {
     std::error_code fec;
     if (!std::filesystem::is_regular_file(path, fec)) co_return std::nullopt;
 
+#if defined(BOOST_ASIO_HAS_FILE)
     try {
         asio::stream_file file(co_await asio::this_coro::executor, path,
                                asio::stream_file::read_only);
@@ -133,6 +138,11 @@ asio::awaitable<std::optional<std::string>> readFileAsync(const std::string& pat
     } catch (const boost::system::system_error&) {
         co_return std::nullopt;
     }
+#else
+    std::ifstream f(path, std::ios::binary);
+    if (!f) co_return std::nullopt;
+    co_return std::string{(std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()};
+#endif
 }
 
 } // namespace
@@ -200,7 +210,9 @@ asio::awaitable<void> Ctx::beginSse(int status) {
     res.set(http::field::cache_control, "no-cache");
     res.chunked(true);
     http::response_serializer<http::string_body> sr{res};
-    co_await http::async_write_header(*sock, sr);
+    // explicit token: the implicit default is awaitable only since Boost 1.84+
+    // (deferred became the default completion token); 1.81-1.83 need this
+    co_await http::async_write_header(*sock, sr, asio::use_awaitable);
     // The 30s deadline set before the session read persists across
     // operations and covers all later writes; long streams must lift it
     sock->expires_never();

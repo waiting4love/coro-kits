@@ -73,7 +73,11 @@ int main() {
         asio::io_context ioc;
         asio::ip::tcp::acceptor acceptor(ioc, {asio::ip::make_address("127.0.0.1"), kPort});
         app->selfBase = "http://127.0.0.1:" + std::to_string(acceptor.local_endpoint().port());
-        asio::co_spawn(ioc, listen(std::move(acceptor), router, HttpConfig{}), asio::detached);
+        // named config: it must outlive ioc.run() - listen() keeps a
+        // reference inside the lazy coroutine frame (a temporary would
+        // dangle; see demo/main.cpp)
+        HttpConfig cfg;
+        asio::co_spawn(ioc, listen(std::move(acceptor), router, cfg), asio::detached);
 
         asio::signal_set signals(ioc, SIGINT, SIGTERM);
         signals.async_wait([&ioc](const boost::system::error_code&, int sig) {

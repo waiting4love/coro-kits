@@ -63,6 +63,29 @@ ctest --test-dir build/verify --output-on-failure   # 45 tests expected
 On machines with system deps, a plain `cmake -S . -B build && cmake --build
 build && ctest --test-dir build` works (find_package path).
 
+### WSL (Ubuntu-24) — the find_package path on this host
+
+The Windows host has no system OpenSSL/Boost/SQLite, but WSL does after
+installing packages (as root; `wsl -d Ubuntu-24 -u root` needs no password):
+
+```bash
+DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake \
+  ninja-build libboost-dev libboost-json-dev libboost-url-dev \
+  libssl-dev libsqlite3-dev libgtest-dev pkg-config
+```
+
+Ubuntu 24.04 provides GCC 13, CMake 3.28, Boost 1.83, OpenSSL 3.0,
+SQLite 3.45. Build as the default user (faster than /mnt/d):
+
+```bash
+tar --exclude=./build -cf - . | (cd ~/corokit && tar -xf -)
+cd ~/corokit && cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build
+```
+
+Git Bash gotchas: prefix wsl.exe calls with `MSYS_NO_PATHCONV=1` (it rewrites
+/mnt/... paths), and never `pkill -f <pattern>` where the pattern occurs in
+the calling command line (it kills the caller's own shell).
+
 ## Engineering red lines (C++20 coroutines, single-threaded io_context)
 
 - Everything runs on one `io_context` (Node event-loop semantics): stores
@@ -73,6 +96,10 @@ build && ctest --test-dir build` works (find_package path).
   errors as values, or stash an `exception_ptr` and rethrow after the catch.
 - Coroutine-lambda closures are not copied into frames: name them and keep
   them alive until the coroutine finishes.
+- Reference arguments to lazy coroutines (anything returning asio::awaitable)
+  must point at objects that outlive `ioc.run()` - never pass temporaries.
+  `listen(..., HttpConfig{})` dangles inside the coroutine frame; it
+  segfaulted on GCC/Linux while silently passing on Windows/clang.
 - `HttpClient` forwarders on the shell must stay plain functions (zero
   coroutine keywords) — a coroutine shell would capture the shell `this` and
   defeat the PIMPL movability. The stable-address rule: no frame may capture
