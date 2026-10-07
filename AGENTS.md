@@ -34,8 +34,14 @@ reuse `OpenSSL::SSL`/`OpenSSL::Crypto`, `Boost::json`, `Boost::headers`,
 fall back to `find_package`. Details and gotchas:
 
 - Inside a Boost superproject build `Boost::headers` is an empty
-  pseudo-library — include dirs live on the per-module targets. The CMake
-  aggregates `Boost::asio/beast/json/url` when they exist. Keep this logic.
+  pseudo-library — include dirs live on the per-module targets (wrapped in
+  BUILD_INTERFACE generator expressions; boost/version.hpp belongs to the
+  config module). The CMake aggregates `Boost::asio/beast/json/url` when
+  they exist. Keep this logic.
+- Version floors surface as explanatory FATAL_ERRORs at configure time
+  (Boost 1.81 / OpenSSL 1.1 / SQLite 3.37, best-effort detection) plus
+  static_asserts in src/http.hpp, src/openssl.cpp and src/sqlite.cpp as the
+  authoritative backstop.
 - demo/tests default OFF when consumed as a subproject (`PROJECT_IS_TOP_LEVEL`).
 - GoogleTest is only fetched under `COROKIT_BUILD_TESTS=ON` (system
   `find_package(GTest CONFIG)` preferred).

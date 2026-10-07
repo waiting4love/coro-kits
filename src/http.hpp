@@ -16,9 +16,16 @@
 #include <boost/beast.hpp>
 #include <boost/json.hpp>
 #include <boost/url.hpp> // origin-form parsing: decoded path segments and query params
+#include <boost/version.hpp>
 
 #include "error.hpp"
 #include "http_config.hpp"
+
+// Authoritative backstop for the configure-time version hints in
+// CMakeLists.txt (covers targets provided without version information)
+static_assert(BOOST_VERSION >= 108100,
+              "coro-kit requires Boost >= 1.81 (Boost.URL); the Boost being "
+              "compiled against is older");
 
 namespace beast = boost::beast;
 namespace http = beast::http;

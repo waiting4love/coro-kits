@@ -8,6 +8,10 @@
 
 #include <sqlite3.h>
 
+// Authoritative backstop for the configure-time version hints in CMakeLists.txt
+static_assert(SQLITE_VERSION_NUMBER >= 3037000L,
+              "coro-kit requires SQLite >= 3.37 (sqlite3_changes64)");
+
 namespace sqlite {
 namespace {
 

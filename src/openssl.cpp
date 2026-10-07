@@ -10,8 +10,14 @@
 #include <openssl/bn.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/opensslv.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
+
+// Authoritative backstop for the configure-time version hints in
+// CMakeLists.txt; LibreSSL version numbers also satisfy this floor
+static_assert(OPENSSL_VERSION_NUMBER >= 0x10100000L,
+              "coro-kit requires OpenSSL/LibreSSL >= 1.1 (opaque RSA APIs)");
 
 namespace openssl {
 namespace {

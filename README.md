@@ -40,12 +40,18 @@ target_link_libraries(your-app PRIVATE corokit::corokit)
 **依赖约定**：库被引入时，若下列 target 已存在则直接复用；不存在才回退系统
 `find_package`——所以"你工程里已有的"就是"coro-kit 用的"：
 
+版本过低会在 configure 期得到一条说明原因与出路的 FATAL_ERROR（Boost
+版本从 `Boost_VERSION` 变量、超级项目变量或 `boost/version.hpp` 三处探
+测，别名/预编译场景也覆盖）；源码里另有 static_assert 兜底（`http.hpp` /
+`openssl.cpp` / `sqlite.cpp`），对所有供依赖方式权威。探测到版本时
+configure 输出一行 `coro-kit: Boost x.y (floor 1.81)` 供确认。
+
 | 库需要的 target | 回退解析 | 说明 |
 |---|---|---|
-| `OpenSSL::SSL` / `OpenSSL::Crypto` | `find_package(OpenSSL)` | **OpenSSL 与 LibreSSL 均可**：走 LibreSSL 的工程自建这对别名即可（`examples/consumer` 有先例） |
+| `OpenSSL::SSL` / `OpenSSL::Crypto` | `find_package(OpenSSL)` | **OpenSSL 与 LibreSSL 均可**（均须 ≥ 1.1，opaque RSA API）；走 LibreSSL 的工程自建这对别名即可（`examples/consumer` 有先例） |
 | `Boost::json` + `Boost::url` | `find_package(Boost COMPONENTS json url)` | ≥ 1.81（Boost.URL 引入线），已测 1.83 与 1.87；url 是编译库（非 header-only），超级项目 FetchContent 与系统安装皆可 |
 | `Boost::url`（可选） | — | Boost ≥ 1.87 存在可编译 URL target 时自动链接，与使用方对齐 `BOOST_URL_*` 宏，避免头/库混用 ODR |
-| `SQLite::SQLite3` 或 `sqlite3` | `find_package(SQLite3)` | amalgamation 自建 target（名字 `sqlite3`）或系统安装皆可 |
+| `SQLite::SQLite3` 或 `sqlite3` | `find_package(SQLite3)` | ≥ 3.37（`sqlite3_changes64`）；amalgamation 自建 target（名字 `sqlite3`）或系统安装皆可 |
 
 被 FetchContent 引入时 demo / 单测默认**不构建**（`COROKIT_BUILD_DEMO` /
 `COROKIT_BUILD_TESTS` 默认 OFF，仅顶层构建为 ON），对使用方零负担。
