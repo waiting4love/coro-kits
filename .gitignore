@@ -1,0 +1,6 @@
+build/
+.vscode/
+.idea/
+.cache/
+*.db
+*.db-journal

@@ -1,0 +1,46 @@
+---
+# clang-tidy config - distilled from full-project static-analysis experience.
+#
+# Usage (repo root):
+#   run-clang-tidy -p build 'src/.*\.cpp$'
+#   clang-tidy -p build src/foo.cpp
+#
+# Notes: only the categories below are enabled; clang-analyzer-* is
+# deliberately off - its diagnostics bypass the header filter and leak
+# Boost.Asio coroutine false positives ("Called C++ object pointer is
+# uninitialized" in awaitable.hpp).
+
+Checks: >
+  -clang-analyzer-*,
+  bugprone-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  -modernize-use-trailing-return-type,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -performance-no-int-to-ptr,
+  -readability-braces-around-statements,
+  -readability-implicit-bool-conversion,
+  -bugprone-easily-swappable-parameters,
+  -readability-function-cognitive-complexity,
+  -modernize-avoid-c-arrays,
+  -modernize-avoid-c-style-cast,
+  -modernize-use-designated-initializers,
+  -bugprone-throwing-static-initialization,
+  -readability-inconsistent-ifelse-braces,
+  -readability-trailing-comma,
+  -readability-math-missing-parentheses,
+  -readability-container-contains,
+  -bugprone-unchecked-string-to-number-conversion,
+  -clang-diagnostic-deprecated-declarations,
+  -clang-diagnostic-null-dereference
+
+# Report diagnostics for the project's own headers only:
+# - the "coro-kit/src" anchor keeps "boost-src" (which contains "src/")
+#   from matching
+# - separators are written [/\\]: on Windows clang-tidy filters with
+#   backslash paths; a forward-slash regex matches no header there and
+#   header diagnostics get silently swallowed
+# - the trailing $ limits to .hpp
+HeaderFilterRegex: 'coro-kit[/\\]src[/\\].*\.hpp$'

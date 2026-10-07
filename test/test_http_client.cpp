@@ -1,0 +1,298 @@
+// HttpClient unit tests: an embedded Router server (127.0.0.1, ephemeral
+// port, fully offline); each case drives the io_context (poll loop) until
+// the client coroutine finishes.
+// Note: the closure of a coroutine lambda must stay alive by name until the
+// coroutine finishes (closures are not copied into coroutine frames; an
+// immediately-invoked temporary dangles its captures).
+// The full https handshake chain (SNI/certificate verification/trust
+// sources/fail-closed) is covered by end-to-end tests with a temporary CA
+// and a TLS mock; no certificate infrastructure is duplicated here - only
+// URL parsing and the buffered http paths.
+
+#include "http_client.hpp"
+
+#include <chrono>
+#include <future>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+
+#include <gtest/gtest.h>
+
+#include "http.hpp" // Router/listen: the embedded test server
+
+namespace {
+
+using namespace std::chrono_literals;
+
+// Drives the ioc until the client coroutine finishes (poll loop with a 10s
+// backstop); the detached listen coroutine on the ioc does not block exit.
+// Exceptions inside the coroutine rethrow on the test thread via the future.
+// makeClient is a coroutine-body factory (a callable returning awaitable<T>);
+// it is called inside drive: the lambda closure is not copied into the
+// coroutine frame (captures are reached through this), so the closure must
+// outlive the coroutine - taking a factory and constructing it in this
+// function's scope removes the "temporary closure dies first" trap at the
+// API level
+template <class MakeClient>
+auto drive(asio::io_context& ioc, MakeClient&& makeClient) {
+    auto client = makeClient();
+    auto fut = asio::co_spawn(ioc, std::move(client), asio::use_future);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (fut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            ioc.stop();
+            ADD_FAILURE() << "client coroutine did not finish in time";
+            throw std::runtime_error("test deadline exceeded");
+        }
+        ioc.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return fut.get();
+}
+
+// Embedded test server: ephemeral port + Router; cases register routes
+// before start()
+struct TestServer {
+    asio::io_context ioc; // declared first: destroyed after the cfg/router referencing it
+    HttpConfig cfg;
+    Router router;
+    asio::ip::tcp::acceptor acceptor;
+    unsigned short port;
+
+    TestServer() : acceptor(ioc, {asio::ip::make_address("127.0.0.1"), 0}),
+                   port(acceptor.local_endpoint().port()) {}
+
+    void start() {
+        asio::co_spawn(ioc, listen(std::move(acceptor), router, cfg), asio::detached);
+    }
+
+    [[nodiscard]] std::string baseUrl() const {
+        return "http://127.0.0.1:" + std::to_string(port);
+    }
+
+    template <class MakeClient>
+    auto run(MakeClient&& makeClient) {
+        return drive(ioc, std::forward<MakeClient>(makeClient));
+    }
+};
+
+// Common client coroutine: swallows HttpError, returns the status code
+// (0 = did not throw as expected)
+auto statusOf(HttpClient& hc, std::string url) {
+    return [&hc, url = std::move(url)]() -> asio::awaitable<int> {
+        try {
+            co_await hc.get(url);
+            co_return 0;
+        } catch (const HttpError& e) {
+            co_return e.status;
+        }
+    };
+}
+
+TEST(HttpClientParseUrlTest, HttpsAndHttp) {
+    auto u = parseUrl("https://api.example.com/v1/chat?x=1");
+    ASSERT_TRUE(u);
+    EXPECT_TRUE(u->tls);
+    EXPECT_EQ(u->host, "api.example.com");
+    EXPECT_EQ(u->port, "443"); // the default port never enters hostHeader
+    EXPECT_EQ(u->target, "/v1/chat?x=1");
+    EXPECT_EQ(u->hostHeader, "api.example.com");
+
+    u = parseUrl("http://127.0.0.1:8080/x");
+    ASSERT_TRUE(u);
+    EXPECT_FALSE(u->tls);
+    EXPECT_EQ(u->port, "8080");
+    EXPECT_EQ(u->hostHeader, "127.0.0.1:8080");
+}
+
+TEST(HttpClientParseUrlTest, DefaultsAndInvalid) {
+    auto u = parseUrl("http://host.example");
+    ASSERT_TRUE(u);
+    EXPECT_EQ(u->port, "80");
+    EXPECT_EQ(u->target, "/");
+    EXPECT_EQ(u->hostHeader, "host.example");
+
+    EXPECT_FALSE(parseUrl("not a url"));
+    EXPECT_FALSE(parseUrl("http://")); // no host
+    EXPECT_FALSE(parseUrl("/relative/path"));
+}
+
+TEST(HttpClientHopByHopTest, Names) {
+    EXPECT_TRUE(hopByHop("connection"));
+    EXPECT_TRUE(hopByHop("Content-Length"));
+    EXPECT_TRUE(hopByHop("TRANSFER-ENCODING"));
+    EXPECT_FALSE(hopByHop("x-test"));
+    EXPECT_FALSE(hopByHop("content-type"));
+}
+
+TEST(HttpClientTest, GetReturnsBodyAndStatus) {
+    TestServer srv;
+    srv.router.add(http::verb::get, "/hello", [](Ctx& ctx) -> asio::awaitable<void> {
+        json::object o;
+        o["ok"] = true;
+        ctx.json(200, o);
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<std::string> {
+        auto res = co_await hc.get(base + "/hello");
+        EXPECT_EQ(res.result(), http::status::ok);
+        co_return std::string(res.body());
+    };
+    EXPECT_EQ(srv.run(call), "{\"ok\":true}");
+}
+
+TEST(HttpClientTest, PostEchoesBodyAndContentType) {
+    TestServer srv;
+    srv.router.add(http::verb::post, "/echo", [](Ctx& ctx) -> asio::awaitable<void> {
+        // echo the request body and content-type verbatim, verifying
+        // request assembly and header passing
+        ctx.res.set(http::field::content_type,
+                    std::string(ctx.req[http::field::content_type]));
+        ctx.res.body() = std::string(ctx.req.body());
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    auto call = [&hc, base = srv.baseUrl()]
+                    -> asio::awaitable<http::response<http::string_body>> {
+        co_return co_await hc.post(base + "/echo", R"({"a":1})", "application/json");
+    };
+    auto res = srv.run(call);
+    EXPECT_EQ(res.result(), http::status::ok);
+    EXPECT_EQ(res.body(), R"({"a":1})");
+    auto ct = res.find(http::field::content_type);
+    ASSERT_TRUE(ct != res.end());
+    EXPECT_EQ(ct->value(), "application/json");
+}
+
+TEST(HttpClientTest, StatusPassthroughWithoutThrow) {
+    TestServer srv;
+    srv.router.add(http::verb::get, "/nope404", [](Ctx& ctx) -> asio::awaitable<void> {
+        json::object o;
+        o["error"] = "no";
+        ctx.json(404, o);
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<http::status> {
+        auto res = co_await hc.get(base + "/nope404");
+        co_return res.result();
+    };
+    EXPECT_EQ(srv.run(call), http::status::not_found); // 4xx does not throw; caller judges
+}
+
+TEST(HttpClientTest, StripsHopByHopHeaders) {
+    TestServer srv;
+    srv.router.add(http::verb::get, "/hop", [](Ctx& ctx) -> asio::awaitable<void> {
+        ctx.res.set("x-test", "kept");
+        ctx.res.set(http::field::connection, "close"); // the client sends close anyway; the server echoes it
+        ctx.res.body() = "hi";
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    auto call = [&hc, base = srv.baseUrl()]
+                    -> asio::awaitable<http::response<http::string_body>> {
+        co_return co_await hc.get(base + "/hop");
+    };
+    auto res = srv.run(call);
+    auto xTest = res.find("x-test");
+    ASSERT_TRUE(xTest != res.end());
+    EXPECT_EQ(xTest->value(), "kept");
+    // hop-by-hop/framing headers are never reused (content-length is
+    // recomputed; forwarding it would double-set)
+    EXPECT_EQ(res.find(http::field::connection), res.end());
+    EXPECT_EQ(res.find(http::field::content_length), res.end());
+    EXPECT_EQ(res.body(), "hi");
+}
+
+TEST(HttpClientTest, ShellMoveDuringFlight) {
+    // Core check of the PIMPL movability: the shell is moved while a request
+    // is in flight (the client coroutine is necessarily suspended mid
+    // exchange); in-flight coroutines hold the stable Impl* and are
+    // unaffected; the destination takes over the same Impl and keeps working
+    TestServer srv;
+    HttpClient origin;  // source shell: emptied while the request is in flight
+    HttpClient movedTo; // destination: takes over the same Impl
+    srv.router.add(http::verb::get, "/move", [&](Ctx& ctx) -> asio::awaitable<void> {
+        movedTo = std::move(origin); // the request has arrived => the client coroutine is suspended
+        ctx.res.body() = "ok";
+        co_return;
+    });
+    srv.router.add(http::verb::get, "/plain", [](Ctx& ctx) -> asio::awaitable<void> {
+        ctx.res.body() = "again";
+        co_return;
+    });
+    srv.start();
+
+    auto first = srv.run([&origin, base = srv.baseUrl()]()
+                             -> asio::awaitable<http::response<http::string_body>> {
+        co_return co_await origin.get(base + "/move");
+    });
+    EXPECT_EQ(first.body(), "ok");
+
+    auto second = srv.run([&movedTo, base = srv.baseUrl()]()
+                              -> asio::awaitable<http::response<http::string_body>> {
+        co_return co_await movedTo.get(base + "/plain");
+    });
+    EXPECT_EQ(second.body(), "again"); // the destination owns the same Impl and can keep issuing requests
+}
+
+TEST(HttpClientTest, MaxBodyBytesGuard) {
+    TestServer srv;
+    srv.router.add(http::verb::get, "/big", [](Ctx& ctx) -> asio::awaitable<void> {
+        ctx.res.set(http::field::content_type, "text/plain");
+        ctx.res.body() = std::string(64, 'x');
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    hc.setMaxBodyBytes(8); // far below the response size
+    EXPECT_EQ(srv.run(statusOf(hc, srv.baseUrl() + "/big")), 502);
+}
+
+TEST(HttpClientTest, TotalCapTimesOut) {
+    TestServer srv;
+    srv.router.add(http::verb::get, "/slow", [](Ctx& ctx) -> asio::awaitable<void> {
+        (void)ctx;
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        timer.expires_after(2s); // far beyond totalCap: the hang is force-closed by the hard cap (-> 504)
+        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        ctx.json(200, json::object{{"ok", true}});
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    hc.setTotalCap(50ms);
+    EXPECT_EQ(srv.run(statusOf(hc, srv.baseUrl() + "/slow")), 504);
+}
+
+TEST(HttpClientTest, ConnectionRefused502) {
+    asio::io_context ioc;
+    asio::ip::tcp::acceptor probe(ioc, {asio::ip::make_address("127.0.0.1"), 0});
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(probe.local_endpoint().port()) + "/";
+    probe.close(); // nothing listens: connect is refused immediately (not a timeout)
+
+    HttpClient hc;
+    EXPECT_EQ(drive(ioc, statusOf(hc, url)), 502);
+}
+
+TEST(HttpClientTest, InvalidUrl500) {
+    asio::io_context ioc;
+    HttpClient hc;
+    EXPECT_EQ(drive(ioc, statusOf(hc, "not a url")), 500);
+}
+
+} // namespace
