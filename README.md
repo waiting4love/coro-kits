@@ -307,4 +307,4 @@ FetchContent 引入后，本库成为唯一上游。
 
 ## License
 
-TBD（发布前请补充 LICENSE 文件）。
+MIT（见 [LICENSE](LICENSE)）——使用、修改、分发、再许可均无限制，仅保留版权与许可声明一行。
