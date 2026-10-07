@@ -2,39 +2,49 @@
 # framework, an outbound HTTP/HTTPS client, JWT verification, and RAII
 # wrappers for SQLite and OpenSSL.
 #
-# Dependency policy: this library pins no third-party dependency versions or
-# sources. Boost / OpenSSL (or LibreSSL) / SQLite are all provided by the
-# consumer, per this contract - a target that already exists is reused
-# directly; only when missing does the library fall back to a system
-# find_package:
-#   OpenSSL::SSL / OpenSSL::Crypto - the find_package(OpenSSL) result; a
-#                                    consumer on LibreSSL just creates these
-#                                    aliases itself (see examples/consumer)
-#   Boost::json + Boost::url      - find_package(Boost COMPONENTS json url)
-#                                    or a Boost superproject via FetchContent;
-#                                    1.81+ required (Boost.URL line); url is
-#                                    a compiled library, not header-only
+# Components (Boost-style per-library model): consumers select what they
+# need by setting COROKIT_INCLUDE_LIBRARIES before pulling this project in
+# (unset/empty = all components; unknown names fail loudly). The selection
+# expands to its transitive closure, and unselected components cost neither
+# build time nor dependencies:
+#
+#   corokit::b64          b64.hpp (header-only)                     - no deps
+#   corokit::openssl      openssl.hpp/.cpp                          - OpenSSL/LibreSSL >= 1.1 (crypto)
+#   corokit::sqlite       sqlite.hpp/.cpp                           - SQLite >= 3.37
+#   corokit::key_loader   key_loader.hpp/.cpp                       - corokit::openssl, b64
+#   corokit::jwt          jwt.hpp/.cpp                              - corokit::key_loader, Boost::json
+#   corokit::http_srv     http_srv.hpp/.cpp, http_config.hpp, error.hpp
+#                                                                   - Boost (asio/beast/json/url), Threads
+#   corokit::http_client  http_client.hpp/.cpp                      - corokit::http_srv, OpenSSL (TLS upstream)
+#   corokit::corokit      umbrella over everything selected
+#
+# Dependency policy: nothing is pinned. Per-component contract - a target
+# that already exists is reused directly, find_package is the fallback;
+# versions and sources stay the consumer's choice:
+#   OpenSSL::SSL / OpenSSL::Crypto - find_package(OpenSSL); a consumer on
+#                                    LibreSSL just creates these aliases
+#                                    itself (see examples/consumer)
+#   Boost::json (+ Boost::url for the http components) - find_package or a
+#                                    Boost superproject via FetchContent;
+#                                    1.81+ required (Boost.URL line)
 #   SQLite::SQLite3 or sqlite3     - find_package(SQLite3) or a self-built
 #                                    amalgamation target
-#
-# Consumption (FetchContent / add_subdirectory) is documented in the README;
-# examples/consumer is a fully compilable sample and doubles as the
-# migration template for "drop the vendored shared modules, fetch the
-# library".
+# Resolutions happen lazily: a dependency is only required when at least one
+# selected component needs it.
 #
 # Linux io_uring: a consumer enabling BOOST_ASIO_HAS_IO_URING must define it
 # globally before pulling this library in (Asio config macros must agree
 # across the whole build or layouts diverge = ODR violation); the uring
 # library is linked by the consumer's final executable targets. Alternatively
-# set COROKIT_ENABLE_IO_URING=ON (the library defines it and links uring
-# itself).
+# set COROKIT_ENABLE_IO_URING=ON (the http components define it and link
+# uring themselves).
 #
 # The test framework (GoogleTest) is only fetched when COROKIT_BUILD_TESTS=ON
-# and does not affect the library's dependency surface: a system
-# find_package(GTest CONFIG) is preferred, FetchContent is the fallback.
+# (which forces all components) and does not affect the library's dependency
+# surface: a system find_package(GTest CONFIG) is preferred.
 
 cmake_minimum_required(VERSION 3.21) # PROJECT_IS_TOP_LEVEL was added in 3.21
-project(corokit VERSION 0.1.0 LANGUAGES CXX)
+project(corokit VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,52 +59,121 @@ endif()
 # (zero friction for consumers)
 if(PROJECT_IS_TOP_LEVEL)
   option(COROKIT_BUILD_DEMO "Build the demo server" ON)
-  option(COROKIT_BUILD_TESTS "Build unit tests" ON)
+  option(COROKIT_BUILD_TESTS "Build unit tests (forces all components)" ON)
 else()
   option(COROKIT_BUILD_DEMO "Build the demo server" OFF)
-  option(COROKIT_BUILD_TESTS "Build unit tests" OFF)
+  option(COROKIT_BUILD_TESTS "Build unit tests (forces all components)" OFF)
 endif()
 option(COROKIT_ENABLE_IO_URING "Define BOOST_ASIO_HAS_IO_URING and link uring" OFF)
 
 include(FetchContent)
 
 # ---------------------------------------------------------------------------
-# Dependency resolution (all can be pre-provided by the consumer; see the
-# file header)
+# Component selection (BOOST_INCLUDE_LIBRARIES style)
 # ---------------------------------------------------------------------------
-find_package(Threads REQUIRED)
+set(COROKIT_ALL_COMPONENTS "b64" "openssl" "sqlite" "key_loader" "jwt" "http_srv" "http_client")
 
-if(NOT TARGET OpenSSL::SSL)
-  find_package(OpenSSL REQUIRED) # also provides OpenSSL::Crypto
+if(COROKIT_BUILD_TESTS)
+  # the suite covers every component
+  set(COROKIT_INCLUDE_LIBRARIES "${COROKIT_ALL_COMPONENTS}")
+elseif(NOT DEFINED COROKIT_INCLUDE_LIBRARIES OR COROKIT_INCLUDE_LIBRARIES STREQUAL "")
+  set(COROKIT_INCLUDE_LIBRARIES "${COROKIT_ALL_COMPONENTS}")
 endif()
 
-# Boost resolves in two steps: headers/version first, the compiled json/url
-# components only after the version floor check below - so a too-old Boost
-# fails with our explanatory message instead of a confusing "missing: url"
-if(NOT TARGET Boost::json)
-  find_package(Boost REQUIRED)
+foreach(_c IN LISTS COROKIT_INCLUDE_LIBRARIES)
+  if(NOT "${_c}" IN_LIST COROKIT_ALL_COMPONENTS)
+    message(FATAL_ERROR
+      "coro-kit: unknown component '${_c}'. Valid components: ${COROKIT_ALL_COMPONENTS}")
+  endif()
+endforeach()
+
+# Expand the selection to its transitive closure
+set(COROKIT_COMPONENTS ${COROKIT_INCLUDE_LIBRARIES})
+foreach(_c IN LISTS COROKIT_INCLUDE_LIBRARIES)
+  if(_c STREQUAL "jwt")
+    list(APPEND COROKIT_COMPONENTS key_loader openssl b64)
+  elseif(_c STREQUAL "key_loader")
+    list(APPEND COROKIT_COMPONENTS openssl b64)
+  elseif(_c STREQUAL "http_client")
+    list(APPEND COROKIT_COMPONENTS http_srv)
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES COROKIT_COMPONENTS)
+message(STATUS "coro-kit components: ${COROKIT_COMPONENTS}")
+
+set(COROKIT_WANT_OPENSSL OFF)
+set(COROKIT_WANT_BOOST OFF)
+if("openssl" IN_LIST COROKIT_COMPONENTS OR "key_loader" IN_LIST COROKIT_COMPONENTS OR
+   "jwt" IN_LIST COROKIT_COMPONENTS OR "http_client" IN_LIST COROKIT_COMPONENTS)
+  set(COROKIT_WANT_OPENSSL ON)
+endif()
+if("http_srv" IN_LIST COROKIT_COMPONENTS OR "http_client" IN_LIST COROKIT_COMPONENTS OR
+   "jwt" IN_LIST COROKIT_COMPONENTS)
+  set(COROKIT_WANT_BOOST ON)
 endif()
 
-if(TARGET SQLite::SQLite3)
-  set(COROKIT_SQLITE_LINK SQLite::SQLite3)
-elseif(TARGET sqlite3)
-  set(COROKIT_SQLITE_LINK sqlite3)
-else()
-  find_package(SQLite3 REQUIRED)
-  set(COROKIT_SQLITE_LINK SQLite::SQLite3)
+# ---------------------------------------------------------------------------
+# Dependency resolution - lazy, per component (see the file header)
+# ---------------------------------------------------------------------------
+if("http_srv" IN_LIST COROKIT_COMPONENTS OR "sqlite" IN_LIST COROKIT_COMPONENTS)
+  find_package(Threads REQUIRED)
+endif()
+
+if(COROKIT_WANT_OPENSSL)
+  if(NOT TARGET OpenSSL::SSL)
+    find_package(OpenSSL REQUIRED) # also provides OpenSSL::Crypto
+  endif()
+  if(DEFINED OPENSSL_VERSION AND OPENSSL_VERSION VERSION_LESS 1.1)
+    message(FATAL_ERROR
+      "coro-kit requires OpenSSL/LibreSSL >= 1.1 (opaque RSA APIs), but found "
+      "${OPENSSL_VERSION}. Provide a newer OpenSSL/LibreSSL to your project.")
+  endif()
+endif()
+
+# Boost resolves in two steps: headers/version first, the compiled components
+# only after the version floor check below - so a too-old Boost fails with
+# our explanatory message instead of a confusing "missing: url"
+set(_boost_components "")
+if(COROKIT_WANT_BOOST)
+  list(APPEND _boost_components json)
+  if("http_srv" IN_LIST COROKIT_COMPONENTS OR "http_client" IN_LIST COROKIT_COMPONENTS)
+    list(APPEND _boost_components url)
+  endif()
+  list(REMOVE_DUPLICATES _boost_components)
+  if(NOT TARGET Boost::json)
+    find_package(Boost REQUIRED)
+  endif()
+endif()
+
+set(COROKIT_SQLITE_LINK "")
+if("sqlite" IN_LIST COROKIT_COMPONENTS)
+  if(TARGET SQLite::SQLite3)
+    set(COROKIT_SQLITE_LINK SQLite::SQLite3)
+  elseif(TARGET sqlite3)
+    set(COROKIT_SQLITE_LINK sqlite3)
+  else()
+    find_package(SQLite3 REQUIRED)
+    set(COROKIT_SQLITE_LINK SQLite::SQLite3)
+  endif()
+  if(DEFINED SQLite3_VERSION AND SQLite3_VERSION VERSION_LESS 3.37)
+    message(FATAL_ERROR
+      "coro-kit requires SQLite >= 3.37 (sqlite3_changes64), but found "
+      "${SQLite3_VERSION}. Provide a newer SQLite to your project.")
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
 # Version floors (configure-time best effort). The static_asserts in
-# src/http.hpp, src/openssl.cpp and src/sqlite.cpp are the authoritative
+# src/http_srv.hpp, src/openssl.cpp and src/sqlite.cpp are the authoritative
 # backstop for setups that provide targets without version information.
 # ---------------------------------------------------------------------------
 # Boost version, tried in order: the Boost_VERSION variable (find_package),
 # Boost_SUPERPROJECT_VERSION (superproject), or parsed from boost/version.hpp
-# on the include path of the provided Boost::headers target (covers
-# alias/prebuilt setups)
+# on the include path of the provided targets (covers alias/prebuilt setups)
 set(COROKIT_BOOST_VERSION "")
-if(DEFINED Boost_VERSION)
+if(NOT COROKIT_WANT_BOOST)
+  # nothing to check
+elseif(DEFINED Boost_VERSION)
   set(COROKIT_BOOST_VERSION "${Boost_VERSION}")
 elseif(DEFINED Boost_SUPERPROJECT_VERSION)
   set(COROKIT_BOOST_VERSION "${Boost_SUPERPROJECT_VERSION}")
@@ -148,109 +227,157 @@ else()
   endforeach()
 endif()
 
-if(COROKIT_BOOST_VERSION)
-  if(COROKIT_BOOST_VERSION VERSION_LESS 1.81)
-    message(FATAL_ERROR
-      "coro-kit requires Boost >= 1.81 (Boost.URL; tested with 1.83 and 1.87), "
-      "but found Boost ${COROKIT_BOOST_VERSION}. Provide a newer Boost to your "
-      "project: upgrade the installed package, or FetchContent a newer Boost "
-      "superproject before pulling in coro-kit.")
+if(COROKIT_WANT_BOOST)
+  if(COROKIT_BOOST_VERSION)
+    if(COROKIT_BOOST_VERSION VERSION_LESS 1.81)
+      message(FATAL_ERROR
+        "coro-kit requires Boost >= 1.81 (Boost.URL; tested with 1.83 and 1.87), "
+        "but found Boost ${COROKIT_BOOST_VERSION}. Provide a newer Boost to your "
+        "project: upgrade the installed package, or FetchContent a newer Boost "
+        "superproject before pulling in coro-kit.")
+    endif()
+    message(STATUS "coro-kit: Boost ${COROKIT_BOOST_VERSION} (floor 1.81)")
+  else()
+    message(STATUS "coro-kit: Boost version not detectable (pre-provided targets); floor is 1.81")
   endif()
-  message(STATUS "coro-kit: Boost ${COROKIT_BOOST_VERSION} (floor 1.81)")
-else()
-  message(STATUS "coro-kit: Boost version not detectable (pre-provided targets); floor is 1.81")
-endif()
 
-if(DEFINED OPENSSL_VERSION AND OPENSSL_VERSION VERSION_LESS 1.1)
-  message(FATAL_ERROR
-    "coro-kit requires OpenSSL/LibreSSL >= 1.1 (opaque RSA APIs), but found "
-    "${OPENSSL_VERSION}. Provide a newer OpenSSL/LibreSSL to your project.")
-endif()
-
-if(DEFINED SQLite3_VERSION AND SQLite3_VERSION VERSION_LESS 3.37)
-  message(FATAL_ERROR
-    "coro-kit requires SQLite >= 3.37 (sqlite3_changes64), but found "
-    "${SQLite3_VERSION}. Provide a newer SQLite to your project.")
-endif()
-
-if(NOT TARGET Boost::json)
-  # url is a compiled library since Boost 1.81 (Boost.URL's iterator/params
-  # implementations live in libboost_url), not header-only
-  find_package(Boost REQUIRED COMPONENTS json url)
-endif()
-# Boost header aggregation (after all component targets exist): for an
-# installed Boost or FindBoost, Boost::headers is the full include set; but
-# inside a Boost superproject (in-tree FetchContent build) it is an empty
-# pseudo-library and the include dirs live on the per-module targets - so
-# aggregate them one by one where they exist; both shapes end up with
-# complete header paths
-set(COROKIT_BOOST_LINK Boost::headers Boost::json)
-foreach(comp IN ITEMS asio beast url)
-  if(TARGET Boost::${comp})
-    list(APPEND COROKIT_BOOST_LINK Boost::${comp})
+  if(NOT TARGET Boost::json)
+    # url is a compiled library since Boost 1.81 (Boost.URL's iterator/params
+    # implementations live in libboost_url), not header-only
+    find_package(Boost REQUIRED COMPONENTS ${_boost_components})
   endif()
+  # Boost header aggregation (after all component targets exist): for an
+  # installed Boost or FindBoost, Boost::headers is the full include set; but
+  # inside a Boost superproject (in-tree FetchContent build) it is an empty
+  # pseudo-library and the include dirs live on the per-module targets - so
+  # aggregate them one by one where they exist; both shapes end up with
+  # complete header paths
+  set(COROKIT_BOOST_LINK Boost::headers Boost::json)
+  foreach(comp IN ITEMS asio beast url)
+    if(TARGET Boost::${comp})
+      list(APPEND COROKIT_BOOST_LINK Boost::${comp})
+    endif()
+  endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+set(COROKIT_INC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+
+function(corokit_target_flags tgt)
+  if(MSVC)
+    target_compile_options(${tgt} PRIVATE /utf-8) # sources contain non-ASCII; avoids C4819
+  endif()
+  if(WIN32)
+    # Minimum target OS for Boost.Asio; PRIVATE touches only this target's
+    # TUs and does not constrain the consumer
+    target_compile_definitions(${tgt} PRIVATE _WIN32_WINNT=0x0A00)
+  endif()
+  if(UNIX)
+    target_compile_options(${tgt} PRIVATE -Wall -Wextra)
+  endif()
+endfunction()
+
+if("b64" IN_LIST COROKIT_COMPONENTS)
+  add_library(corokit_b64 INTERFACE)
+  add_library(corokit::b64 ALIAS corokit_b64)
+  target_compile_features(corokit_b64 INTERFACE cxx_std_20)
+  target_include_directories(corokit_b64 INTERFACE ${COROKIT_INC})
+endif()
+
+if("openssl" IN_LIST COROKIT_COMPONENTS)
+  add_library(corokit_openssl STATIC src/openssl.cpp)
+  add_library(corokit::openssl ALIAS corokit_openssl)
+  target_compile_features(corokit_openssl PUBLIC cxx_std_20)
+  target_include_directories(corokit_openssl PUBLIC ${COROKIT_INC})
+  target_link_libraries(corokit_openssl PUBLIC OpenSSL::Crypto)
+  corokit_target_flags(corokit_openssl)
+endif()
+
+if("sqlite" IN_LIST COROKIT_COMPONENTS)
+  add_library(corokit_sqlite STATIC src/sqlite.cpp)
+  add_library(corokit::sqlite ALIAS corokit_sqlite)
+  target_compile_features(corokit_sqlite PUBLIC cxx_std_20)
+  target_include_directories(corokit_sqlite PUBLIC ${COROKIT_INC})
+  target_link_libraries(corokit_sqlite PUBLIC ${COROKIT_SQLITE_LINK} Threads::Threads)
+  corokit_target_flags(corokit_sqlite)
+endif()
+
+if("key_loader" IN_LIST COROKIT_COMPONENTS)
+  add_library(corokit_key_loader STATIC src/key_loader.cpp)
+  add_library(corokit::key_loader ALIAS corokit_key_loader)
+  target_compile_features(corokit_key_loader PUBLIC cxx_std_20)
+  target_include_directories(corokit_key_loader PUBLIC ${COROKIT_INC})
+  # key_loader.hpp includes openssl.hpp -> consumers may use openssl::Key
+  target_link_libraries(corokit_key_loader PUBLIC corokit_openssl)
+  corokit_target_flags(corokit_key_loader)
+endif()
+
+if("jwt" IN_LIST COROKIT_COMPONENTS)
+  add_library(corokit_jwt STATIC src/jwt.cpp)
+  add_library(corokit::jwt ALIAS corokit_jwt)
+  target_compile_features(corokit_jwt PUBLIC cxx_std_20)
+  target_include_directories(corokit_jwt PUBLIC ${COROKIT_INC})
+  # jwt.hpp exposes key_loader.hpp and boost/json.hpp
+  target_link_libraries(corokit_jwt PUBLIC corokit_key_loader ${COROKIT_BOOST_LINK})
+  corokit_target_flags(corokit_jwt)
+endif()
+
+if("http_srv" IN_LIST COROKIT_COMPONENTS)
+  add_library(corokit_http_srv STATIC src/http_srv.cpp)
+  add_library(corokit::http_srv ALIAS corokit_http_srv)
+  target_compile_features(corokit_http_srv PUBLIC cxx_std_20)
+  target_include_directories(corokit_http_srv PUBLIC ${COROKIT_INC})
+  # http_srv.hpp exposes Boost types
+  target_link_libraries(corokit_http_srv PUBLIC ${COROKIT_BOOST_LINK} Threads::Threads)
+  if(COROKIT_ENABLE_IO_URING)
+    target_compile_definitions(corokit_http_srv PUBLIC BOOST_ASIO_HAS_IO_URING)
+    target_link_libraries(corokit_http_srv PUBLIC uring)
+  endif()
+  corokit_target_flags(corokit_http_srv)
+endif()
+
+if("http_client" IN_LIST COROKIT_COMPONENTS)
+  add_library(corokit_http_client STATIC src/http_client.cpp)
+  add_library(corokit::http_client ALIAS corokit_http_client)
+  target_compile_features(corokit_http_client PUBLIC cxx_std_20)
+  target_include_directories(corokit_http_client PUBLIC ${COROKIT_INC})
+  # http_client.hpp includes http_srv.hpp (Boost types) and does TLS upstream
+  target_link_libraries(corokit_http_client PUBLIC
+    corokit_http_srv
+    OpenSSL::SSL
+    OpenSSL::Crypto
+  )
+  if(COROKIT_ENABLE_IO_URING)
+    target_compile_definitions(corokit_http_client PUBLIC BOOST_ASIO_HAS_IO_URING)
+  endif()
+  corokit_target_flags(corokit_http_client)
+endif()
+
+# Umbrella over the selected components (link everything with one target)
+add_library(corokit_corokit INTERFACE)
+add_library(corokit::corokit ALIAS corokit_corokit)
+foreach(_c IN LISTS COROKIT_COMPONENTS)
+  target_link_libraries(corokit_corokit INTERFACE corokit::${_c})
 endforeach()
 
 # ---------------------------------------------------------------------------
-# The library
-# ---------------------------------------------------------------------------
-add_library(corokit STATIC
-  src/http.cpp
-  src/http_client.cpp
-  src/jwt.cpp
-  src/key_loader.cpp
-  src/openssl.cpp
-  src/sqlite.cpp
-)
-add_library(corokit::corokit ALIAS corokit)
-target_compile_features(corokit PUBLIC cxx_std_20)
-target_include_directories(corokit PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
-# All PUBLIC: headers expose Boost types; ssl/crypto/sqlite symbols flow from
-# the static library into the final link
-target_link_libraries(corokit PUBLIC
-  ${COROKIT_BOOST_LINK}
-  OpenSSL::SSL
-  OpenSSL::Crypto
-  Threads::Threads
-  ${COROKIT_SQLITE_LINK}
-)
-if(MSVC)
-  target_compile_options(corokit PRIVATE /utf-8) # sources contain non-ASCII; avoids C4819
-endif()
-if(WIN32)
-  # Minimum target OS for Boost.Asio; PRIVATE touches only this library's
-  # TUs and does not constrain the consumer
-  target_compile_definitions(corokit PRIVATE _WIN32_WINNT=0x0A00)
-endif()
-if(COROKIT_ENABLE_IO_URING)
-  target_compile_definitions(corokit PUBLIC BOOST_ASIO_HAS_IO_URING)
-  target_link_libraries(corokit PUBLIC uring)
-endif()
-if(UNIX)
-  target_compile_options(corokit PRIVATE -Wall -Wextra)
-endif()
-
-# ---------------------------------------------------------------------------
 # demo: Koa-style server + SSE + cookies + outbound client self-fetch
-# (top-level builds only)
+# (top-level builds only; needs the http components)
 # ---------------------------------------------------------------------------
 if(COROKIT_BUILD_DEMO)
+  if(NOT ("http_srv" IN_LIST COROKIT_COMPONENTS AND "http_client" IN_LIST COROKIT_COMPONENTS))
+    message(FATAL_ERROR "the coro-kit demo requires the http_srv and http_client components")
+  endif()
   add_executable(demo demo/main.cpp)
-  target_link_libraries(demo PRIVATE corokit)
-  if(MSVC)
-    target_compile_options(demo PRIVATE /utf-8)
-  endif()
-  if(WIN32)
-    target_compile_definitions(demo PRIVATE _WIN32_WINNT=0x0A00)
-  endif()
-  if(UNIX)
-    target_compile_options(demo PRIVATE -Wall -Wextra)
-  endif()
+  target_link_libraries(demo PRIVATE corokit::http_srv corokit::http_client)
+  corokit_target_flags(demo)
 endif()
 
 # ---------------------------------------------------------------------------
-# Unit tests (only when COROKIT_BUILD_TESTS=ON; prefer a system GTest,
-# FetchContent as fallback)
+# Unit tests (only when COROKIT_BUILD_TESTS=ON; forces all components.
+# Prefer a system GTest, FetchContent as fallback)
 # ---------------------------------------------------------------------------
 if(COROKIT_BUILD_TESTS)
   find_package(GTest CONFIG QUIET)
@@ -269,22 +396,14 @@ if(COROKIT_BUILD_TESTS)
   # Test keys: test/keys/ holds test-only 1024-bit RSA keys (.NET XML), committed to the repo
   add_executable(corokit-tests
     test/test_b64.cpp
-    test/test_http.cpp
+    test/test_http_srv.cpp
     test/test_http_client.cpp
     test/test_jwt.cpp
     test/test_key_loader.cpp
   )
-  target_link_libraries(corokit-tests PRIVATE corokit GTest::gtest_main)
+  target_link_libraries(corokit-tests PRIVATE corokit::corokit GTest::gtest_main)
   target_compile_definitions(corokit-tests PRIVATE KEYS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/keys")
-  if(MSVC)
-    target_compile_options(corokit-tests PRIVATE /utf-8)
-  endif()
-  if(WIN32)
-    target_compile_definitions(corokit-tests PRIVATE _WIN32_WINNT=0x0A00)
-  endif()
-  if(UNIX)
-    target_compile_options(corokit-tests PRIVATE -Wall -Wextra)
-  endif()
+  corokit_target_flags(corokit-tests)
 
   enable_testing()
   include(GoogleTest)

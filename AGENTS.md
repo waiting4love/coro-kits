@@ -17,13 +17,22 @@ meant to be open-sourced on GitHub.
 ## Layout
 
 ```
-CMakeLists.txt       # zero pinned deps: if(NOT TARGET) contract + find_package fallback
+CMakeLists.txt       # components + lazy dependency resolution + version floors
 src/                 # all modules, flat layout, included as "xxx.hpp"
-demo/main.cpp        # all-in-one demo (top-level builds only)
+demo/main.cpp        # all-in-one demo (top-level builds only; http components)
 test/                # gtest unit tests + test-only 1024-bit RSA keys in test/keys/
-examples/consumer/   # consumer sample = migration template (pins its own deps,
-                     # FetchContents coro-kit, builds a small business server)
+examples/consumer/   # consumer sample = migration template: pins LibreSSL + Boost,
+                     # selects only the http components (no SQLite needed)
 ```
+
+Components (Boost-style; consumers set `COROKIT_INCLUDE_LIBRARIES` before
+pulling this project in, unset/empty = all): `b64` (header-only), `openssl`,
+`sqlite`, `key_loader` (-> openssl), `jwt` (-> key_loader + Boost.json),
+`http_srv` (src/http_srv.hpp/.cpp + http_config.hpp + error.hpp), `http_client`
+(-> http_srv + OpenSSL for upstream TLS), plus the `corokit::corokit` umbrella.
+Dependency resolution is lazy per component: a sqlite-only consumer never
+triggers Boost/OpenSSL lookups. Note the module was renamed http -> http_srv
+(headers included as "http_srv.hpp").
 
 ## Dependency policy (do not break this)
 
@@ -40,34 +49,33 @@ fall back to `find_package`. Details and gotchas:
   they exist. Keep this logic.
 - Version floors surface as explanatory FATAL_ERRORs at configure time
   (Boost 1.81 / OpenSSL 1.1 / SQLite 3.37, best-effort detection) plus
-  static_asserts in src/http.hpp, src/openssl.cpp and src/sqlite.cpp as the
-  authoritative backstop.
+  static_asserts in src/http_srv.hpp, src/openssl.cpp and src/sqlite.cpp as
+  the authoritative backstop.
 - demo/tests default OFF when consumed as a subproject (`PROJECT_IS_TOP_LEVEL`).
 - GoogleTest is only fetched under `COROKIT_BUILD_TESTS=ON` (system
-  `find_package(GTest CONFIG)` preferred).
+  `find_package(GTest CONFIG)` preferred; it forces all components).
 
 ## Build & test (this machine: Windows, LLVM clang + Ninja + Git Bash)
 
 This machine has no system OpenSSL/Boost/SQLite, so a top-level configure
-cannot resolve dependencies. Verify via the consumer example, redirecting
-dependency sources to a sibling project's cache (no re-download):
+cannot resolve all dependencies. Verify the FetchContent path via the
+consumer example (http components only - Boost + LibreSSL redirections
+suffice, no SQLite/gtest needed):
 
 ```bash
 cd coro-kit
 D="<abs path to some built sibling>/cpp/build/_deps"
 cmake -S examples/consumer -B build/verify -G Ninja \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCOROKIT_BUILD_TESTS=ON \
   -DFETCHCONTENT_SOURCE_DIR_BOOST="$D/boost-src" \
-  -DFETCHCONTENT_SOURCE_DIR_LIBRESSL="$D/libressl-src" \
-  -DFETCHCONTENT_SOURCE_DIR_SQLITE3="$D/sqlite3-src" \
-  -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST="$D/googletest-src"
+  -DFETCHCONTENT_SOURCE_DIR_LIBRESSL="$D/libressl-src"
 cmake --build build/verify
-ctest --test-dir build/verify --output-on-failure   # 45 tests expected
+./build/verify/consumer   # default port 18081
 ```
 
-On machines with system deps, a plain `cmake -S . -B build && cmake --build
-build && ctest --test-dir build` works (find_package path).
+The full test suite runs on WSL (see below). On machines with system deps, a
+plain `cmake -S . -B build && cmake --build build && ctest --test-dir build`
+works (find_package path).
 
 ### WSL (Ubuntu-24) — the find_package path on this host
 
@@ -86,7 +94,12 @@ SQLite 3.45. Build as the default user (faster than /mnt/d):
 ```bash
 tar --exclude=./build -cf - . | (cd ~/corokit && tar -xf -)
 cd ~/corokit && cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build
+# 47 tests expected (the suite forces all components)
 ```
+
+WSL also proves the lazy-dependency property of component selection: a
+`-DCOROKIT_INCLUDE_LIBRARIES=sqlite` configure resolves no Boost/OpenSSL at
+all.
 
 Git Bash gotchas: prefix wsl.exe calls with `MSYS_NO_PATHCONV=1` (it rewrites
 /mnt/... paths), and never `pkill -f <pattern>` where the pattern occurs in

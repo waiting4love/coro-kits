@@ -1,4 +1,4 @@
-#include "http.hpp"
+#include "http_srv.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -122,7 +122,7 @@ asio::awaitable<std::optional<std::string>> readFileAsync(const std::string& pat
     std::error_code fec;
     if (!std::filesystem::is_regular_file(path, fec)) co_return std::nullopt;
 
-#if defined(BOOST_ASIO_HAS_FILE)
+#ifdef BOOST_ASIO_HAS_FILE
     try {
         asio::stream_file file(co_await asio::this_coro::executor, path,
                                asio::stream_file::read_only);

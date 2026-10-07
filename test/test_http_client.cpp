@@ -20,7 +20,7 @@
 
 #include <gtest/gtest.h>
 
-#include "http.hpp" // Router/listen: the embedded test server
+#include "http_srv.hpp" // Router/listen: the embedded test server
 
 namespace {
 

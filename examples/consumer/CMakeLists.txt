@@ -1,11 +1,15 @@
 # coro-kit consumer example: simulates the full shape of "a business repo
 # dropped its vendored shared modules and now FetchContents coro-kit".
 #
+# Component selection in action: this app needs only the HTTP pieces, so it
+# sets COROKIT_INCLUDE_LIBRARIES to "http_srv;http_client" - no SQLite is
+# provided (or needed) here, and the jwt/openssl/key_loader/sqlite components
+# are never built.
+#
 # Dependency versions are this example's own choice (pinning here is the
-# example's decision, not a requirement of coro-kit):
-#   LibreSSL 4.1.0 / Boost 1.87.0 / SQLite 3.46.1 - the set used by the
-#   originating services. The OpenSSL::* aliases and the sqlite3 target are
-#   self-provided; coro-kit detects them and reuses them directly.
+# example's decision, not a requirement of coro-kit): LibreSSL 4.1.0 +
+# Boost 1.87.0. The OpenSSL::* aliases are self-provided; coro-kit detects
+# them and reuses them directly.
 #
 # During local development coro-kit is pulled in via SOURCE_DIR pointing at
 # the repo root; once published to GitHub switch to the commented
@@ -71,39 +75,24 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Boost)
 
 # ---------------------------------------------------------------------------
-# SQLite amalgamation (the zip has no CMakeLists.txt: wrap it in our own target)
-# ---------------------------------------------------------------------------
-FetchContent_Declare(
-  sqlite3
-  URL https://sqlite.org/2024/sqlite-amalgamation-3460100.zip
-  URL_HASH SHA256=77823cb110929c2bcb0f5d48e4833b5c59a8a6e40cdea3936b99e199dbbe5784
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE # fixed-version release tarball: keep timestamps (CMP0135)
-)
-FetchContent_MakeAvailable(sqlite3)
-add_library(sqlite3 STATIC ${sqlite3_SOURCE_DIR}/sqlite3.c)
-target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
-find_package(Threads REQUIRED)
-target_link_libraries(sqlite3 PRIVATE Threads::Threads)
-if(UNIX)
-  target_link_libraries(sqlite3 PRIVATE m ${CMAKE_DL_LIBS})
-endif()
-
-# ---------------------------------------------------------------------------
 # coro-kit (the shared modules come from the library now; the business repo
-# no longer carries their sources)
+# no longer carries their sources). Only the HTTP components are requested -
+# nothing sqlite-related is required on this machine.
 # ---------------------------------------------------------------------------
+set(COROKIT_INCLUDE_LIBRARIES "http_srv" "http_client")
 FetchContent_Declare(corokit
   SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.."
   # GIT_REPOSITORY https://github.com/<you>/coro-kit.git
-  # GIT_TAG        v0.1.0
+  # GIT_TAG        v0.2.0
 )
 FetchContent_MakeAvailable(corokit)
 
 # ---------------------------------------------------------------------------
-# The business itself: only includes coro-kit headers, only links corokit::corokit
+# The business itself: only includes coro-kit headers, only links the
+# components it uses (http_srv comes in transitively via http_client)
 # ---------------------------------------------------------------------------
 add_executable(consumer main.cpp)
-target_link_libraries(consumer PRIVATE corokit::corokit)
+target_link_libraries(consumer PRIVATE corokit::http_client)
 if(UNIX)
   target_compile_options(consumer PRIVATE -Wall -Wextra)
 endif()

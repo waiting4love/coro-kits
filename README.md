@@ -14,43 +14,64 @@ ctx/router、jsonwebtoken 的错误分类、Buffer.from 的宽容 base64）。
 
 ## 模块一览
 
-| 模块 | 文件 | 职责 |
-|---|---|---|
-| HTTP 服务框架 | `http.hpp/.cpp`、`http_config.hpp` | 监听、路由（静态段 / `:param` / `*` 尾通配）、405+Allow、静态资源 + SPA fallback、Cookie、SSE 流式响应、中央错误处理 → JSON、CORS 预检 |
-| 出站 HTTP 客户端 | `http_client.hpp/.cpp` | 缓冲式 `get/post/put/del/request` + 流式 `exchange`（handler 接口）；TLS（SNI、证书链与 DNS/IP 身份验证）、两级超时（建连预算 + 总时长硬顶 + body 滚动空闲）、PIMPL 可移动 |
-| JWT | `jwt.hpp/.cpp` | RS256 验签 / 签发；`TokenExpiredError` / `NotBeforeError` / `JsonWebTokenError` 错误名与 [jsonwebtoken](https://github.com/auth0/node-jsonwebtoken) 对齐 |
-| OpenSSL RAII | `openssl.hpp/.cpp` | `openssl::Key`（EVP_PKEY 统一层）、`signRsaSha256/verifyRsaSha256`、PKCS#1 v1.5 分块加解密、`randomBytes`；业务代码不触碰裸 C API |
-| SQLite RAII | `sqlite.hpp/.cpp` | `Db` / `Statement` / `Transaction`；语句一次 prepare 长期复用、事务不显式 commit 析构即回滚、约束冲突抛 `ConstraintError` 子类 |
-| .NET 密钥加载 | `key_loader.hpp/.cpp` | `RSAKeyValue` XML（`RSACryptoServiceProvider.ToXmlString()` 格式）→ `openssl::Key` |
-| base64 | `b64.hpp` | 标准 / base64url 双字母表；解码宽容（忽略空白与缺失填充，对齐 Node `Buffer.from`） |
-| HTTP 业务错误 | `error.hpp` | `HttpError(status, message, expose)`，handler 抛出、框架统一转 JSON 响应 |
+| 模块 | 组件 | 文件 | 职责 |
+|---|---|---|---|
+| HTTP 服务框架 | `corokit::http_srv` | `http_srv.hpp/.cpp`、`http_config.hpp`、`error.hpp` | 监听、路由（静态段 / `:param` / `*` 尾通配）、405+Allow、静态资源 + SPA fallback、Cookie、SSE 流式响应、中央错误处理 → JSON、CORS 预检 |
+| 出站 HTTP 客户端 | `corokit::http_client` | `http_client.hpp/.cpp` | 缓冲式 `get/post/put/del/request` + 流式 `exchange`（handler 接口）；TLS（SNI、证书链与 DNS/IP 身份验证）、两级超时（建连预算 + 总时长硬顶 + body 滚动空闲）、PIMPL 可移动 |
+| JWT | `corokit::jwt` | `jwt.hpp/.cpp` | RS256 验签 / 签发；`TokenExpiredError` / `NotBeforeError` / `JsonWebTokenError` 错误名与 [jsonwebtoken](https://github.com/auth0/node-jsonwebtoken) 对齐 |
+| OpenSSL RAII | `corokit::openssl` | `openssl.hpp/.cpp` | `openssl::Key`（EVP_PKEY 统一层）、`signRsaSha256/verifyRsaSha256`、PKCS#1 v1.5 分块加解密、`randomBytes`；业务代码不触碰裸 C API |
+| SQLite RAII | `corokit::sqlite` | `sqlite.hpp/.cpp` | `Db` / `Statement` / `Transaction`；语句一次 prepare 长期复用、事务不显式 commit 析构即回滚、约束冲突抛 `ConstraintError` 子类 |
+| .NET 密钥加载 | `corokit::key_loader` | `key_loader.hpp/.cpp` | `RSAKeyValue` XML（`RSACryptoServiceProvider.ToXmlString()` 格式）→ `openssl::Key` |
+| base64 | `corokit::b64` | `b64.hpp` | 标准 / base64url 双字母表；解码宽容（忽略空白与缺失填充，对齐 Node `Buffer.from`） |
+
+`error.hpp` / `http_config.hpp` 随 `corokit::http_srv` 提供；另有伞目标
+`corokit::corokit`（等于全部选中组件）。
 
 ## 在你的工程中引入
 
 ```cmake
 include(FetchContent)
-# ……先按你工程自己的方式备好依赖（版本来源完全由你定），然后：
+# ……先按你工程自己的方式备好所选组件的依赖（版本来源完全由你定），然后：
+set(COROKIT_INCLUDE_LIBRARIES "http_srv" "http_client")  # 可选：只引所需组件（缺省=全部）
 FetchContent_Declare(corokit
   GIT_REPOSITORY https://github.com/<you>/coro-kit.git
-  GIT_TAG        v0.1.0)
+  GIT_TAG        v0.2.0)
 FetchContent_MakeAvailable(corokit)
-target_link_libraries(your-app PRIVATE corokit::corokit)
+target_link_libraries(your-app PRIVATE corokit::http_client)  # 按需链组件，或用伞目标
 ```
+
+**组件选择对齐 Boost 的 `BOOST_INCLUDE_LIBRARIES`**：引入前设置
+`COROKIT_INCLUDE_LIBRARIES` 即可，选择会自动展开到传递闭包（如 `jwt` 自带
+`key_loader`、`openssl`）；未知组件名直接报错并列出合法值。各组件与额外依赖：
+
+| 组件 | 额外依赖 |
+|---|---|
+| `corokit::b64` | 无（header-only） |
+| `corokit::openssl` | OpenSSL/LibreSSL ≥ 1.1 |
+| `corokit::sqlite` | SQLite ≥ 3.37 |
+| `corokit::key_loader` | `corokit::openssl` |
+| `corokit::jwt` | `corokit::key_loader`、Boost::json |
+| `corokit::http_srv` | Boost（asio/beast/json/url）、Threads |
+| `corokit::http_client` | `corokit::http_srv`、OpenSSL（上游 TLS） |
+| `corokit::corokit` | 伞目标：全部选中组件 |
+
+**依赖解析是懒的**：只有至少一个选中组件需要某依赖时才会探测它——只引
+`corokit::sqlite` 的工程完全不需要装 Boost 与 OpenSSL，反之只引 http 组件的
+工程不需要 SQLite。
 
 **依赖约定**：库被引入时，若下列 target 已存在则直接复用；不存在才回退系统
 `find_package`——所以"你工程里已有的"就是"coro-kit 用的"：
 
 版本过低会在 configure 期得到一条说明原因与出路的 FATAL_ERROR（Boost
 版本从 `Boost_VERSION` 变量、超级项目变量或 `boost/version.hpp` 三处探
-测，别名/预编译场景也覆盖）；源码里另有 static_assert 兜底（`http.hpp` /
+测，别名/预编译场景也覆盖）；源码里另有 static_assert 兜底（`http_srv.hpp` /
 `openssl.cpp` / `sqlite.cpp`），对所有供依赖方式权威。探测到版本时
 configure 输出一行 `coro-kit: Boost x.y (floor 1.81)` 供确认。
 
 | 库需要的 target | 回退解析 | 说明 |
 |---|---|---|
 | `OpenSSL::SSL` / `OpenSSL::Crypto` | `find_package(OpenSSL)` | **OpenSSL 与 LibreSSL 均可**（均须 ≥ 1.1，opaque RSA API）；走 LibreSSL 的工程自建这对别名即可（`examples/consumer` 有先例） |
-| `Boost::json` + `Boost::url` | `find_package(Boost COMPONENTS json url)` | ≥ 1.81（Boost.URL 引入线），已测 1.83 与 1.87；url 是编译库（非 header-only），超级项目 FetchContent 与系统安装皆可 |
-| `Boost::url`（可选） | — | Boost ≥ 1.87 存在可编译 URL target 时自动链接，与使用方对齐 `BOOST_URL_*` 宏，避免头/库混用 ODR |
+| `Boost::json`（http 组件另需 `Boost::url`） | `find_package(Boost COMPONENTS ...)` | ≥ 1.81（Boost.URL 引入线），已测 1.83 与 1.87；url 是编译库（非 header-only），超级项目 FetchContent 与系统安装皆可 |
 | `SQLite::SQLite3` 或 `sqlite3` | `find_package(SQLite3)` | ≥ 3.37（`sqlite3_changes64`）；amalgamation 自建 target（名字 `sqlite3`）或系统安装皆可 |
 
 被 FetchContent 引入时 demo / 单测默认**不构建**（`COROKIT_BUILD_DEMO` /
@@ -66,26 +87,27 @@ configure 输出一行 `coro-kit: Boost x.y (floor 1.81)` 供确认。
   `oldnames`（cl.exe 自动链、CMake+clang 不带）；系统 OpenSSL 无此问题
 
 `examples/consumer` 是一个完整可编译的消费样例：自钉一套依赖版本（LibreSSL
-4.1.0 / Boost 1.87.0 / SQLite 3.46.1）+ FetchContent 引入 coro-kit + 一个
-纯业务视角的小服务——**它同时就是"业务仓库删除公共模块后切换到 coro-kit"的
-迁移模板**。
+4.1.0 / Boost 1.87.0）、`COROKIT_INCLUDE_LIBRARIES` 只选 http 组件（**本机
+无需安装 SQLite**）+ FetchContent 引入 coro-kit + 一个纯业务视角的小服务
+——**它同时就是"业务仓库删除公共模块后切换到 coro-kit"的迁移模板**。
 
 ### 从"仓库内携带公共模块"迁移到 FetchContent
 
 以 public-services 三仓为例，每个仓库的切换步骤：
 
-1. 删除本仓 `cpp/src/` 下的公共模块文件（`http.*`、`http_config.hpp`、
-   `error.hpp`、`b64.hpp`、`key_loader.*`、`sqlite.*`、`openssl.*`、`jwt.*`、
-   `http_client.*`）及对应测试（`test_b64/test_http/test_key_loader/test_jwt/
-   test_http_client` 与测试密钥）
-2. `CMakeLists.txt` 里加 `FetchContent_Declare(corokit GIT_REPOSITORY …)` +
-   `MakeAvailable`（放在 LibreSSL/Boost/sqlite 依赖块之后——库检测到
-   `OpenSSL::*` 别名、`Boost::json`、`sqlite3` 已存在即直接复用，零重复构建）
-3. 业务目标源列表去掉公共模块的 .cpp，链接加 `corokit::corokit`
-4. 业务代码**一行不改**：`#include "http.hpp"` 等头文件名与 flat 布局经
-   corokit 的 PUBLIC include 原样透出
-5. 既有依赖钉版块（LibreSSL/Boost/SQLite 的 FetchContent）原样保留——版本
-   决定权在你手里，coro-kit 不参与
+1. 删除本仓 `cpp/src/` 下的公共模块文件（`http_srv.*`（原 `http.*`）、
+   `http_config.hpp`、`error.hpp`、`b64.hpp`、`key_loader.*`、`sqlite.*`、
+   `openssl.*`、`jwt.*`、`http_client.*`）及对应测试（`test_b64/test_http_srv/
+   test_key_loader/test_jwt/test_http_client` 与测试密钥）
+2. `CMakeLists.txt` 里加 `set(COROKIT_INCLUDE_LIBRARIES ...)` 按需选组件 +
+   `FetchContent_Declare(corokit GIT_REPOSITORY …)` + `MakeAvailable`（放在
+   自备依赖块之后——库检测到 `OpenSSL::*` 别名、`Boost::json`、`sqlite3`
+   已存在即直接复用，零重复构建；未选中的组件连依赖都不要求）
+3. 业务目标源列表去掉公共模块的 .cpp，链接改为所用组件（如
+   `corokit::http_srv corokit::http_client`，或图省事链 `corokit::corokit`）
+4. 业务代码仅改 include 的模块名：`#include "http.hpp"` → `"http_srv.hpp"`，
+   其余头文件名与 flat 布局经各组件的 PUBLIC include 原样透出
+5. 既有依赖钉版块原样保留——版本决定权在你手里，coro-kit 不参与
 
 ## 顶层独立构建与测试
 
@@ -103,13 +125,21 @@ ctest --test-dir build --output-on-failure
 cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 ```
 
-本机没有系统级依赖时，用 `examples/consumer` 走全链路（自备依赖）：
+本机没有系统级依赖时，用 `examples/consumer` 验证 FetchContent 路径（http
+组件自备依赖，无需 SQLite）：
 
 ```bash
 cmake -S examples/consumer -B build/verify
 cmake --build build/verify
-ctest --test-dir build/verify            # -DCOROKIT_BUILD_TESTS=ON 时含 corokit 全部单测
 ./build/verify/consumer                  # 消费样例服务
+```
+
+组件选择本身也可以直接验证（懒依赖：未选组件不触发任何 find_package）：
+
+```bash
+cmake -S . -B build-sqliteonly -DCOROKIT_BUILD_DEMO=OFF -DCOROKIT_BUILD_TESTS=OFF \
+      -DCOROKIT_INCLUDE_LIBRARIES=sqlite   # 只需系统 SQLite，无需 Boost/OpenSSL
+cmake --build build-sqliteonly
 ```
 
 测试框架（GoogleTest）仅 `COROKIT_BUILD_TESTS=ON` 时获取，且优先复用系统的
@@ -141,7 +171,7 @@ curl -i -X POST http://127.0.0.1:18080/hello/world    # 405 + Allow: HEAD, GET
 ### 服务端（类 Koa）
 
 ```cpp
-#include "http.hpp"
+#include "http_srv.hpp"   // 链接 corokit::http_srv
 
 asio::awaitable<void> hello(Ctx& ctx) {
     ctx.json(200, json::object{{"hello", ctx.params.at("name")}});
@@ -250,11 +280,11 @@ std::string sid = openssl::randomBytes(16);              // 会话号统一走�
 
 ```
 coro-kit/
-├── CMakeLists.txt            # 零依赖钉死：if(NOT TARGET) 约定 + find_package 回退
-├── src/                      # 全部模块（flat 布局，互相以 "xxx.hpp" 引用）
+├── CMakeLists.txt            # 组件化（COROKIT_INCLUDE_LIBRARIES）+ 懒依赖解析 + 版本底线
+├── src/                      # 全部模块（flat 布局，按组件分组，互相以 "xxx.hpp" 引用）
 ├── demo/main.cpp             # 一站式演示：服务端 + SSE + Cookie + 出站客户端
 ├── test/                     # gtest 单测 + 仅测试用的 1024 位 RSA 密钥（keys/）
-└── examples/consumer/        # 消费样例 = 三仓迁移模板（自钉依赖 + FetchContent 本库）
+└── examples/consumer/        # 消费样例 = 迁移模板（只选 http 组件，无需 SQLite）
 ```
 
 ## 测试

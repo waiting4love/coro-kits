@@ -3,7 +3,7 @@
 //
 // Responsibilities: URL parsing, resolve/connect (+TLS: SNI, certificate
 // chain and DNS/IP identity verification), sending the request, receiving
-// response headers and body. Depends only on http.hpp/error.hpp + Boost.
+// response headers and body. Depends only on http_srv.hpp/error.hpp + Boost.
 //
 // Two API levels:
 //   - Buffered get/post/put/del/request: collects the whole body and returns
@@ -57,7 +57,7 @@
 #include <string_view>
 #include <vector>
 
-#include "http.hpp"
+#include "http_srv.hpp"
 
 // Parses an absolute URL. Anything but http/https is treated as non-tls
 // (default port 80, matching the legacy upstream behavior); callers wanting
