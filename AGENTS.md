@@ -121,6 +121,11 @@ the calling command line (it kills the caller's own shell).
 - No `co_await` inside a `catch` handler on this toolchain (clang/MSVC-ABI:
   a bare rethrow crashes in SEH dispatch). Use `asio::as_tuple` to receive
   errors as values, or stash an `exception_ptr` and rethrow after the catch.
+- Error style for asio ops: plain `use_awaitable` already throws
+  `system_error` on error completion - use it whenever the error would be
+  thrown anyway. Reserve `as_tuple(use_awaitable)` for errors handled as
+  VALUES (eof-with-bytes convention, http body_limit side path, acceptor
+  operation_aborted shutdown, timers whose cancellation is ignored).
 - Coroutine-lambda closures are not copied into frames: name them and keep
   them alive until the coroutine finishes.
 - Reference arguments to lazy coroutines (anything returning asio::awaitable)

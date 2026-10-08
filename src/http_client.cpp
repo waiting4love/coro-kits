@@ -218,9 +218,10 @@ asio::awaitable<http::response_parser<http::buffer_body>*> HttpClient::HttpStrea
     reaper.emplace(ex);
     try {
         asio::ip::tcp::resolver resolver(ex);
-        auto [rec, endpoints] = co_await resolver.async_resolve(
-            url.host, url.port, asio::as_tuple(asio::use_awaitable));
-        if (rec) throw boost::system::system_error(rec);
+        // plain use_awaitable throws system_error on error completion - the
+        // manual as_tuple + throw boilerplate was equivalent, this is shorter
+        auto endpoints = co_await resolver.async_resolve(url.host, url.port,
+                                                         asio::use_awaitable);
 
         if (url.tls) {
             tls.emplace(ex, client->sslContext());
