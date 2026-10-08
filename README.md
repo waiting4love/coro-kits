@@ -17,7 +17,7 @@ ctx/router、jsonwebtoken 的错误分类、Buffer.from 的宽容 base64）。
 | 模块 | 组件 | 文件 | 职责 |
 |---|---|---|---|
 | HTTP 服务框架 | `corokit::http_srv` | `http_srv.hpp/.cpp`、`http_config.hpp`、`error.hpp` | 监听、路由（静态段 / `:param` / `*` 尾通配）、405+Allow、静态资源 + SPA fallback、Cookie、SSE 流式响应、中央错误处理 → JSON、CORS 预检 |
-| 出站 HTTP 客户端 | `corokit::http_client` | `http_client.hpp/.cpp` | 缓冲式 `get/post/put/del/request` + 流式 `exchange`（handler 接口）；TLS（SNI、证书链与 DNS/IP 身份验证）、两级超时（建连预算 + 总时长硬顶 + body 滚动空闲）、PIMPL 可移动 |
+| 出站 HTTP 客户端 | `corokit::http_client` | `http_client.hpp/.cpp` | 缓冲式 `get/post/put/del/request` + 流式 `exchange`（handler 接口）与 `HttpStream` 拉式对象（getHead/getChunk，其余两者的共同底座）；TLS（SNI、证书链与 DNS/IP 身份验证）、两级超时（建连预算 + 总时长硬顶 + body 滚动空闲）、PIMPL 可移动 |
 | JWT | `corokit::jwt` | `jwt.hpp/.cpp` | RS256 验签 / 签发；`TokenExpiredError` / `NotBeforeError` / `JsonWebTokenError` 错误名与 [jsonwebtoken](https://github.com/auth0/node-jsonwebtoken) 对齐 |
 | OpenSSL RAII | `corokit::openssl` | `openssl.hpp/.cpp` | `openssl::Key`（EVP_PKEY 统一层）、`signRsaSha256/verifyRsaSha256`、PKCS#1 v1.5 分块加解密、`randomBytes`；业务代码不触碰裸 C API |
 | SQLite RAII | `corokit::sqlite` | `sqlite.hpp/.cpp` | `Db` / `Statement` / `Transaction`；语句一次 prepare 长期复用、事务不显式 commit 析构即回滚、约束冲突抛 `ConstraintError` 子类 |
@@ -225,6 +225,29 @@ struct Relay : HttpClient::ExchangeHandler {
         co_return;
     }
 };
+```
+
+需要**拉式消费**时用 `HttpStream` 对象（exchange/buffered 内部也跑在它上面）——
+`getHead` 后解析器可见（状态/头任取），`getChunk` 逐块拉取；总硬顶到点时以
+`HttpError 504` 异常从挂起的 `co_await` 处冒出，`open` 的 `onHardCap` 参数在
+异常前触发（解阻塞自写模式下卡死的客户端 socket）：
+
+```cpp
+auto s = http.open(*u, std::move(req) /*, onHardCap 钩子 */);
+
+auto* head = co_await s.getHead();   // resolve+建连(+TLS)+写请求+读响应头，一个预算
+                                     // head->get().result_int() 等状态/头信息在此消费
+s.setIdle(std::chrono::milliseconds(15000)); // 可选：body 滚动空闲（缺省不限，totalCap 兜底）
+
+while (auto chunk = co_await s.getChunk())
+    co_await ctx.writeChunk(*chunk); // string_view：指向会话缓冲，至下一次 getChunk 前有效
+// 需要数据活得比下一次 getChunk 久（或想攒批）时用调用方缓冲重载：
+//   char buf[4096];
+//   while (auto n = co_await s.getChunk(buf, sizeof(buf))) use(buf, *n);
+
+// SSE 收尾写写在这里 —— 仍受硬顶保护
+co_await ctx.endStream();
+s.close();                           // 幂等；解除硬顶并关上游（析构亦会执行）
 ```
 
 ### JWT 验签

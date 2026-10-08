@@ -91,15 +91,14 @@ auto statusOf(HttpClient& hc, std::string url) {
     };
 }
 
-// Makes the four-event handler contract observable: records every
-// onHeader/onBody/afterBody/onHardCap invocation
+// Makes the handler contract observable: records every
+// onHeader/onBody/afterBody invocation
 struct RecordingHandler : HttpClient::ExchangeHandler {
     std::string body;
     int status = 0;
     int headers = 0;
     int chunks = 0;
     int afterBodies = 0;
-    int hardCaps = 0;
 
     asio::awaitable<std::optional<std::chrono::milliseconds>>
     onHeader(http::response_parser<http::buffer_body>& p) override {
@@ -118,8 +117,6 @@ struct RecordingHandler : HttpClient::ExchangeHandler {
         ++afterBodies;
         co_return;
     }
-
-    void onHardCap() override { ++hardCaps; }
 };
 
 // Minimal GET request for exchange() against the test server
@@ -303,20 +300,21 @@ TEST(HttpClientTest, StreamingExchangeHappyPathEvents) {
         RecordingHandler h; // lives in this frame, outliving the exchange it is passed to
         auto u = parseUrl(base + "/stream");
         if (!u) throwHttp(500, "bad url");
-        co_await hc.exchange(*u, getRequest(*u), h);
+        int hardCaps = 0;
+        co_await hc.exchange(*u, getRequest(*u), h, [&] { ++hardCaps; });
         EXPECT_EQ(h.headers, 1);
         EXPECT_EQ(h.status, 200);
         EXPECT_GT(h.chunks, 0);
         EXPECT_EQ(h.afterBodies, 1);
-        EXPECT_EQ(h.hardCaps, 0);
+        EXPECT_EQ(hardCaps, 0);
         co_return h.body;
     };
     EXPECT_EQ(srv.run(call), "hello streaming world");
 }
 
 TEST(HttpClientTest, StreamingExchangeHardCapAborts) {
-    // abort path: totalCap fires -> onHardCap runs (before the 504
-    // surfaces); afterBody is skipped
+    // abort path: totalCap fires -> the unblock hook runs (before the
+    // 504 surfaces); afterBody is skipped
     TestServer srv;
     srv.router.add(http::verb::get, "/hang", [](Ctx& ctx) -> asio::awaitable<void> {
         (void)ctx;
@@ -332,14 +330,113 @@ TEST(HttpClientTest, StreamingExchangeHardCapAborts) {
     hc.setTotalCap(50ms);
     auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<int> {
         RecordingHandler h;
+        int hardCaps = 0;
         auto u = parseUrl(base + "/hang");
         if (!u) throwHttp(500, "bad url");
         try {
-            co_await hc.exchange(*u, getRequest(*u), h);
+            co_await hc.exchange(*u, getRequest(*u), h, [&] { ++hardCaps; });
             co_return 0;
         } catch (const HttpError& e) {
-            EXPECT_EQ(h.hardCaps, 1);    // fired before the 504 surfaced
+            EXPECT_EQ(hardCaps, 1);      // fired before the 504 surfaced
             EXPECT_EQ(h.afterBodies, 0); // abort path skips the epilogue
+            co_return e.status;
+        }
+    };
+    EXPECT_EQ(srv.run(call), 504);
+}
+
+TEST(HttpClientTest, StreamObjectHappyPath) {
+    // the object API end to end: lazy open, getHead (parser visible),
+    // view-mode chunks, explicit close; the hard-cap hook never fires
+    TestServer srv;
+    srv.router.add(http::verb::get, "/stream", [](Ctx& ctx) -> asio::awaitable<void> {
+        ctx.res.set(http::field::content_type, "text/plain");
+        ctx.res.body() = "hello stream object";
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<std::string> {
+        auto u = parseUrl(base + "/stream");
+        if (!u) throwHttp(500, "bad url");
+        auto s = hc.open(*u, getRequest(*u));
+        EXPECT_TRUE(s.open_());
+        auto* p = co_await s.getHead();
+        EXPECT_EQ((int)p->get().result_int(), 200);
+        std::string body;
+        while (auto chunk = co_await s.getChunk())
+            body.append(chunk->data(), chunk->size());
+        // (an SSE relay's last-chunk write belongs here - still under the cap)
+        s.close();
+        EXPECT_FALSE(s.open_());
+        co_return body;
+    };
+    EXPECT_EQ(srv.run(call), "hello stream object");
+}
+
+TEST(HttpClientTest, StreamObjectCallerBuffer) {
+    // the span-style read: data lands in caller memory and survives the next
+    // getChunk; also covers reassembling chunked bodies bigger than one read
+    TestServer srv;
+    srv.router.add(http::verb::get, "/big", [](Ctx& ctx) -> asio::awaitable<void> {
+        ctx.res.set(http::field::content_type, "text/plain");
+        ctx.res.body() = std::string(100'000, 'z');
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<std::string> {
+        auto u = parseUrl(base + "/big");
+        if (!u) throwHttp(500, "bad url");
+        auto s = hc.open(*u, getRequest(*u));
+        co_await s.getHead();
+        char buf[4096];
+        std::string body;
+        size_t calls = 0;
+        while (auto n = co_await s.getChunk(buf, sizeof(buf))) {
+            body.append(buf, *n);
+            ++calls;
+        }
+        EXPECT_GT(calls, size_t{1}); // 100k through a 4k buffer takes many reads
+        s.close();
+        co_return body;
+    };
+    EXPECT_EQ(srv.run(call), std::string(100'000, 'z'));
+}
+
+TEST(HttpClientTest, StreamObjectHardCapThrows) {
+    // abort path: the 504 surfaces from getChunk (getHead already returned);
+    // the unblock hook fires first
+    TestServer srv;
+    srv.router.add(http::verb::get, "/hang", [](Ctx& ctx) -> asio::awaitable<void> {
+        (void)ctx;
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        timer.expires_after(2s);
+        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        ctx.json(200, json::object{{"ok", true}});
+        co_return;
+    });
+    srv.start();
+
+    HttpClient hc;
+    hc.setTotalCap(50ms);
+    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<int> {
+        int hardCaps = 0;
+        auto u = parseUrl(base + "/hang");
+        if (!u) throwHttp(500, "bad url");
+        auto s = hc.open(*u, getRequest(*u), [&] { ++hardCaps; });
+        try {
+            // the hung upstream never answers, so the cap can fire at either
+            // suspended point (headers or first chunk); both are the abort path
+            co_await s.getHead();
+            while (auto chunk = co_await s.getChunk()) {
+                (void)chunk;
+            }
+            co_return 0;
+        } catch (const HttpError& e) {
+            EXPECT_EQ(hardCaps, 1); // fired before the 504 surfaced
             co_return e.status;
         }
     };
@@ -385,7 +482,11 @@ TEST(HttpClientTest, ConnectionRefused502) {
     probe.close(); // nothing listens: connect is refused immediately (not a timeout)
 
     HttpClient hc;
-    EXPECT_EQ(drive(ioc, statusOf(hc, url)), 502);
+    try {
+        EXPECT_EQ(drive(ioc, statusOf(hc, url)), 502);
+    } catch (const std::exception& e) {
+        FAIL() << "escaped: " << typeid(e).name() << " : " << e.what();
+    }
 }
 
 TEST(HttpClientTest, InvalidUrl500) {

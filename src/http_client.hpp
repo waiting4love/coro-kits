@@ -122,9 +122,88 @@ public:
     void setTotalCap(std::chrono::milliseconds v);       // hard overall cap; <=0 disables
     void setMaxBodyBytes(size_t v);                      // buffered-path memory guard
 
-    // Streaming exchange (event contract: ExchangeHandler)
+    // Streaming exchange (event contract: ExchangeHandler). onHardCap fires
+    // when the total cap does, before the 504 surfaces: use it to unblock
+    // anything this exchange might be suspended on (e.g. a stalled
+    // zero-window client socket in self-write mode)
     asio::awaitable<void> exchange(const ParsedUrl& u, http::request<http::string_body> req,
-                                   ExchangeHandler& handler);
+                                   ExchangeHandler& handler,
+                                   const std::function<void()>& onHardCap = {});
+
+    // ---- streaming object (pull style; the other two APIs are adapters over it) ----
+
+    // One streamed exchange. Acquire with HttpClient::open(), then:
+    //   auto& head = co_await s.getHead();   // resolve+connect(+TLS)+request+headers,
+    //                                        // one connectTimeout budget; parser out-param
+    //   s.setIdle(15000ms);                  // optional: body-stage rolling idle budget
+    //                                        // (default: unlimited, totalCap is the net)
+    //   while (auto chunk = co_await s.getChunk())
+    //       use(*chunk);                     // or: s.getChunk(std::span<char>)
+    //   /* epilogue writes (e.g. SSE last-chunk) here - still under the total cap */
+    //   s.close();                           // disarm the cap + close the upstream; idempotent
+    //
+    // Abort semantics: when the total cap fires, the upstream is force-closed, the
+    // onHardCap unblock hook (open() parameter) runs first, and the suspended
+    // co_await throws HttpError 504. Transport/timeout failures map to 502/504 at
+    // the suspended co_await; business exceptions cannot arise inside HttpStream.
+    // Lifecycle: movable (the session lives on a shared state object, its address
+    // is stable); must not outlive the HttpClient; close() also runs on destruction.
+    // Not thread-safe: confined to the io_context thread like everything else.
+    class HttpStream {
+    public:
+        HttpStream() = default; // an empty shell: assign a real one over it via move
+        HttpStream(HttpStream&&) noexcept;
+        HttpStream& operator=(HttpStream&&) noexcept;
+        ~HttpStream(); // implies close()
+        HttpStream(const HttpStream&) = delete;
+        HttpStream& operator=(const HttpStream&) = delete;
+
+        [[nodiscard]] bool open_() const noexcept; // test hook: whether a session is attached
+
+        // Runs resolve+connect(+TLS)+request write+response-header read under one
+        // connectTimeout budget. Returns the live parser (status, headers, and the
+        // buffer_body for advanced use); the reference stays valid for the stream's
+        // lifetime. Invalid without a session (shell) or after close(): throws
+        // HttpError 500
+        asio::awaitable<http::response_parser<http::buffer_body>*> getHead(); // never null; caller-held for the stream lifetime
+
+        // Body-stage rolling idle budget: re-armed before every read, so silence
+        // between chunks beyond it aborts via beast (-> 504). Call after getHead(),
+        // before the first getChunk; values <= 0 disable (default)
+        void setIdle(std::chrono::milliseconds v);
+
+        // Next non-empty body chunk; a view into the session's internal buffer,
+        // valid until the NEXT getChunk call (or close/destruction - it is
+        // overwritten in place, and a stale view often still "looks right": if the
+        // data must outlive the next call, use the span overload below).
+        // nullopt = body complete (subsequent calls keep returning nullopt)
+        asio::awaitable<std::optional<std::string_view>> getChunk();
+
+        // Caller-buffered variant (asio idiom): reads straight into `out` - zero
+        // copy, and data survives past the next call. Returns the bytes read;
+        // nullopt = body complete. At most `n` bytes per call; chunking upstream
+        // is not preserved (a "chunk" is whatever fits the buffer)
+        asio::awaitable<std::optional<size_t>> getChunk(char* out, size_t n);
+
+        // Disarms the total cap and closes the upstream. Idempotent; after close()
+        // the object returns to the detached state (getHead/getChunk throw 500).
+        // The epilogue (e.g. SSE last-chunk) belongs BEFORE this call, so it stays
+        // under the cap
+        void close();
+
+    private:
+        friend class HttpClient;
+        struct Session; // defined inside Impl (http_client.cpp)
+        explicit HttpStream(std::shared_ptr<Session> s) noexcept; // Impl-only
+        std::shared_ptr<Session> session_; // empty = detached shell
+    };
+
+    // Lazily acquires a streamed exchange: nothing runs until getHead(). onHardCap
+    // is the unblock hook: it fires when the total cap does, before the 504
+    // surfaces - close anything the exchange might be suspended on (a stalled
+    // zero-window client socket; only closing the upstream would never wake it)
+    HttpStream open(const ParsedUrl& u, http::request<http::string_body> req,
+                    const std::function<void()>& onHardCap = {});
 
     // ---- buffered (defined in http_client.cpp; keeps this header lean) ----
 

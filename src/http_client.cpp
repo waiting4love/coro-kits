@@ -124,102 +124,8 @@ public:
     std::chrono::milliseconds totalCap{60000};       // hard overall cap; <=0 disables
     size_t maxBodyBytes = 8ULL * 1024 * 1024;        // buffered-path memory guard
 
-    asio::awaitable<void> exchange(const ParsedUrl& u, http::request<http::string_body> req,
-                                   ExchangeHandler& handler) {
-        auto ex = co_await asio::this_coro::executor;
 
-        asio::steady_timer reaper(ex);
-        bool capped = false;
-        auto arm = [&](auto& upstream) {
-            if (totalCap <= std::chrono::milliseconds(0)) return;
-            reaper.expires_after(totalCap);
-            armReaper(reaper, upstream, capped, handler);
-        };
-
-        // resolve+connect (+TLS handshake) + request write + response-header
-        // read share one connectTimeout budget
-        try {
-            asio::ip::tcp::resolver resolver(ex);
-            auto [rec, endpoints] = co_await resolver.async_resolve(
-                u.host, u.port, asio::as_tuple(asio::use_awaitable));
-            if (rec) throw boost::system::system_error(rec);
-
-            if (u.tls) {
-                asio::ssl::stream<beast::tcp_stream> upstream(ex, sslContext());
-                setupTls(upstream, u.host);
-                arm(upstream);
-
-                beast::get_lowest_layer(upstream).expires_after(connectTimeout);
-                co_await beast::get_lowest_layer(upstream).async_connect(endpoints,
-                                                                         asio::use_awaitable);
-                co_await upstream.async_handshake(asio::ssl::stream_base::client,
-                                                  asio::use_awaitable);
-                co_await requestAndRelay(upstream, req, handler, reaper);
-            } else {
-                beast::tcp_stream upstream(ex);
-                arm(upstream);
-                upstream.expires_after(connectTimeout);
-                co_await upstream.async_connect(endpoints, asio::use_awaitable);
-                co_await requestAndRelay(upstream, req, handler, reaper);
-            }
-        } catch (const boost::system::system_error& e) {
-            // Single exit for system_error from every stage (connect/request/
-            // headers/body). A reaper hit (force close yields
-            // operation_aborted) reports as 504 first, matching idle-timeout
-            // semantics
-            if (capped) throwHttp(504, "Upstream stream timed out");
-            throwUpstreamError(e);
-        }
-    }
-
-    // ---- buffered ----
-
-    asio::awaitable<http::response<http::string_body>> get(const std::string& url) {
-        co_return co_await request(http::verb::get, url, {}, "");
-    }
-
-    asio::awaitable<http::response<http::string_body>>
-    post(const std::string& url, std::string body, const std::string& contentType) {
-        std::vector<std::pair<std::string, std::string>> headers;
-        if (!contentType.empty()) headers.emplace_back("content-type", contentType);
-        co_return co_await request(http::verb::post, url, std::move(headers), std::move(body));
-    }
-
-    asio::awaitable<http::response<http::string_body>>
-    put(const std::string& url, std::string body, const std::string& contentType) {
-        std::vector<std::pair<std::string, std::string>> headers;
-        if (!contentType.empty()) headers.emplace_back("content-type", contentType);
-        co_return co_await request(http::verb::put, url, std::move(headers), std::move(body));
-    }
-
-    asio::awaitable<http::response<http::string_body>> del(const std::string& url) {
-        co_return co_await request(http::verb::delete_, url, {}, "");
-    }
-
-    asio::awaitable<http::response<http::string_body>>
-    request(http::verb method, const std::string& url,
-            std::vector<std::pair<std::string, std::string>> extraHeaders, std::string body) {
-        auto u = parseUrl(url);
-        if (!u) throwHttp(500, "invalid url", false);
-
-        http::request<http::string_body> req{method, u->target, 11};
-        req.set(http::field::host, u->hostHeader);
-        req.set(http::field::user_agent, "http-client-cpp");
-        for (const auto& [k, v] : extraHeaders) req.set(k, v);
-        req.body() = std::move(body);
-        req.keep_alive(false); // one request per connection (no upstream pooling)
-        req.prepare_payload();
-
-        BufferedHandler handler{maxBodyBytes}; // buffered: the default afterBody/onHardCap no-ops apply
-        co_await exchange(*u, std::move(req), handler);
-
-        http::response<http::string_body> res{http::status(handler.status), handler.version};
-        for (const auto& [k, v] : handler.headers) res.insert(k, v);
-        res.body() = std::move(handler.body);
-        co_return res;
-    }
-
-private:
+    // (used by the HttpStream session below; internal to this .cpp)
     // Errors from connect/request/headers/body stages -> 504/502 (beast deadline/idle timeouts -> 504)
     [[noreturn]] static void throwUpstreamError(const boost::system::system_error& e) {
         if (e.code() == beast::error::timeout)
@@ -248,76 +154,156 @@ private:
 
     static constexpr size_t kReadBuf = 16384;
 
-    // Hard-cap watchdog: guards against an upstream that neither closes nor
-    // sends (a hang the idle timeout cannot reach) and against writes
-    // stalled by a zero-window client. close() fails pending operations
-    // immediately, without relying on coroutine cancellation. Handlers with
-    // ec=aborted are still posted after cancel/destruction: the frame may
-    // already be gone, so check ec before touching any reference
-    template <class Stream>
-    static void armReaper(asio::steady_timer& timer, Stream& upstream, bool& capped,
-                          ExchangeHandler& handler) {
-        timer.async_wait([&upstream, &capped, &handler](const boost::system::error_code& ec) {
+    std::optional<asio::ssl::context> sslc_; // lazily initialized on first https, then reused read-only
+};
+
+// ---- HttpStream session. Defined at shell scope: it IS
+// HttpClient::HttpStream::Session, and holds an Impl* for sslContext()/
+// setupTls()/error mapping. Heap-owned via shared_ptr inside HttpStream: the
+// reaper's completion handler holds a copy too, so an abandoned stream still
+// gets its upstream closed when the cap fires. The coroutines are Session
+// members - their frames bind this Session's shared_ptr-stable address ----
+struct HttpClient::HttpStream::Session : std::enable_shared_from_this<Session> {
+    Impl* client = nullptr;      // owning HttpClient's Impl; stable address (PIMPL)
+    ParsedUrl url;
+    http::request<http::string_body> req;
+    std::function<void()> onHardCap;
+    std::chrono::milliseconds connectTimeout{};
+    std::chrono::milliseconds totalCap{};
+
+    std::optional<asio::steady_timer> reaper; // emplaced in head() once the executor is known
+    beast::flat_buffer left;    // bytes over-read past the headers (first body chunk)
+    http::response_parser<http::buffer_body> parser;
+    std::optional<beast::tcp_stream> plain;
+    std::optional<asio::ssl::stream<beast::tcp_stream>> tls;
+    std::optional<std::chrono::milliseconds> idle;
+    bool capped = false;
+    bool headDone = false;
+    bool closed = false;
+    bool reaperArmed = false;
+
+    // The reaper shares ownership of the session, so it never dangles; after
+    // close() both stream optionals are disengaged and the hook still fires
+    // (an abandoned stream's client socket must be unblocked just the same)
+    void armReaper() {
+        if (totalCap <= std::chrono::milliseconds(0)) return;
+        if (!reaper) return; // head() not reached: nothing to arm (plain shell misuse)
+        reaperArmed = true;
+        reaper->expires_after(totalCap); // NOLINT(bugprone-unchecked-optional-access) emplaced at head() entry, before any arm
+        reaper->async_wait( // NOLINT(bugprone-unchecked-optional-access) emplaced at head() entry, before any arm
+            [self = shared_from_this()](const boost::system::error_code& ec) {
             if (ec) return;
-            capped = true;
-            beast::get_lowest_layer(upstream).close();
-            handler.onHardCap(); // synchronous, from a completion handler: must not throw
+            self->capped = true;
+            if (self->plain) beast::get_lowest_layer(*self->plain).close(); // NOLINT(bugprone-unchecked-optional-access) capped implies a live stream
+            if (self->tls) beast::get_lowest_layer(*self->tls).close(); // NOLINT(bugprone-unchecked-optional-access) capped implies a live stream
+            if (self->onHardCap) self->onHardCap(); // completion handler: must not throw
         });
     }
 
-    // Reads the body to eof (buffer_body incremental mode); one virtual
-    // handler.onBody call per chunk. When idle has a value it is a rolling
-    // idle timeout: a beast deadline set right before each read; silence
-    // between reads beyond the budget makes beast close the upstream (->
-    // 504). Set before the read, not at the loop head: the sink's writes
-    // do not consume idle budget
-    template <class Stream>
-    static asio::awaitable<void> pumpBody(Stream& upstream, beast::flat_buffer& left,
-                                          http::response_parser<http::buffer_body>& p,
-                                          ExchangeHandler& handler,
-                                          std::optional<std::chrono::milliseconds> idle) {
-        char buf[kReadBuf];
-        while (!p.is_done()) {
-            p.get().body().data = buf;
-            p.get().body().size = sizeof(buf);
-            if (idle) beast::get_lowest_layer(upstream).expires_after(*idle);
-            auto [ec, n] = co_await http::async_read_some(upstream, left, p,
-                                                          asio::as_tuple(asio::use_awaitable));
-            (void)n;
-            if (ec && ec != http::error::need_buffer)
-                throw boost::system::system_error(ec); // mid-stream break/idle timeout: mapped to 502/504 at the exit
-            size_t got = sizeof(buf) - p.get().body().size;
-            if (got > 0) co_await handler.onBody(buf, got);
+    // Best-effort teardown: called from destructors and abort paths, so it
+    // must never throw - a close/cancel failure changes nothing that matters
+    void closeUpstream() noexcept { // NOLINT(bugprone-exception-escape) best-effort teardown: beast close/cancel never throws in practice, and the catch above guards the signature-level possibility
+        try {
+            if (plain) { // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+                plain->close();
+                plain.reset();
+            }
+            if (tls) {
+                beast::get_lowest_layer(*tls).close();
+                tls.reset();
+            }
+            // an armed reaper must always be disarmed: its handler keeps the
+            // session alive and would fire later
+            if (reaperArmed) reaper->cancel(); // NOLINT(bugprone-unchecked-optional-access) armed implies emplaced
+        } catch (const boost::system::system_error&) { // NOLINT(bugprone-empty-catch) teardown failures are genuinely ignorable here
         }
-        if (idle) beast::get_lowest_layer(upstream).expires_never();
+        closed = true;
     }
 
-    // write request -> read response headers -> onHeader (decides the body
-    // idle budget) -> lift the first-byte budget -> pump body -> afterBody
-    // (e.g. the SSE last-chunk write) -> disarm the hard cap
-    template <class Stream>
-    static asio::awaitable<void> requestAndRelay(Stream& upstream,
-                                                 http::request<http::string_body>& req,
-                                                 ExchangeHandler& handler,
-                                                 asio::steady_timer& reaper) {
-        co_await http::async_write(upstream, req, asio::use_awaitable);
+    static constexpr size_t kReadBuf = 16384;
+    char buf[kReadBuf]; // view-mode chunk storage (shared across chunks; see the getChunk contract)
 
-        beast::flat_buffer left; // bytes over-read past the headers (the first body chunk)
-        http::response_parser<http::buffer_body> p;
-        // lift the default limit before reading headers; the guard is the
-        // handler's decision (unlimited for SSE, maxBodyBytes for buffered)
-        p.body_limit(boost::none);
-        co_await http::async_read_header(upstream, left, p, asio::use_awaitable);
-
-        auto idle = co_await handler.onHeader(p);
-        beast::get_lowest_layer(upstream).expires_never();
-        co_await pumpBody(upstream, left, p, handler, idle);
-        co_await handler.afterBody(); // no-op unless overridden
-        reaper.cancel(); // normal finish disarms the cap (later aborted callbacks only check ec, touching no references)
-    }
-
-    std::optional<asio::ssl::context> sslc_; // lazily initialized on first https, then reused read-only
+    // The coroutines are Session members: the frame binds this Session's
+    // address, never a shell. Defined below
+    asio::awaitable<http::response_parser<http::buffer_body>*> head();
+    asio::awaitable<std::optional<size_t>> chunk(char* out, size_t n);
 };
+
+// ---- Session coroutines (defined out of line; frames bind the Session's
+// shared_ptr-stable address). System errors map to 502/504 at these single
+// exits, matching the historical behavior; a reaper hit reports 504 first ----
+
+// resolve+connect (+TLS handshake) + request write + response-header read
+// under one connectTimeout budget; returns with the parser ready and the
+// first-byte budget lifted (idle decides from here)
+asio::awaitable<http::response_parser<http::buffer_body>*> HttpClient::HttpStream::Session::head() {
+    auto ex = co_await asio::this_coro::executor;
+    reaper.emplace(ex);
+    try {
+        asio::ip::tcp::resolver resolver(ex);
+        auto [rec, endpoints] = co_await resolver.async_resolve(
+            url.host, url.port, asio::as_tuple(asio::use_awaitable));
+        if (rec) throw boost::system::system_error(rec);
+
+        if (url.tls) {
+            tls.emplace(ex, client->sslContext());
+            Impl::setupTls(*tls, url.host);
+            armReaper();
+            beast::get_lowest_layer(*tls).expires_after(connectTimeout); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+            co_await beast::get_lowest_layer(*tls).async_connect(endpoints, asio::use_awaitable); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+            co_await tls->async_handshake(asio::ssl::stream_base::client, asio::use_awaitable); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+        } else {
+            plain.emplace(ex);
+            armReaper();
+            plain->expires_after(connectTimeout); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+            co_await plain->async_connect(endpoints, asio::use_awaitable); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+        } // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+
+        // head/body ops only need the lowest layer; read/write over it
+        auto* lowest = tls ? &beast::get_lowest_layer(*tls) : &beast::get_lowest_layer(*plain); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+ // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+        co_await http::async_write(*lowest, req, asio::use_awaitable);
+        // lift the default parser limit; body-size guards are the caller's
+        // business (the buffered adapter re-applies maxBodyBytes via its handler)
+        parser.body_limit(boost::none);
+        co_await http::async_read_header(*lowest, left, parser, asio::use_awaitable);
+        lowest->expires_never();
+    } catch (const boost::system::system_error& e) {
+        closeUpstream();
+        if (capped) throwHttp(504, "Upstream stream timed out");
+        Impl::throwUpstreamError(e);
+    }
+    headDone = true;
+    co_return &parser;
+}
+
+// One body chunk into `out` (buffer_body incremental mode); a rolling idle
+// deadline is set right before each read, so the caller's own writes between
+// chunks never consume idle budget. http::error::need_buffer is the
+// buffer_body handshake, not a failure; anything else travels to the exit
+asio::awaitable<std::optional<size_t>>
+HttpClient::HttpStream::Session::chunk(char* out, size_t n) {
+    if (closed || !headDone) throwHttp(500, "HttpStream used out of order", false);
+    if (parser.is_done()) co_return std::nullopt;
+
+    auto* lowest = tls ? &beast::get_lowest_layer(*tls) : &beast::get_lowest_layer(*plain); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+ // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
+    parser.get().body().data = out;
+    parser.get().body().size = n;
+    if (idle) lowest->expires_after(*idle);
+    try {
+        co_await http::async_read_some(*lowest, left, parser, asio::use_awaitable);
+    } catch (const boost::system::system_error& e) {
+        if (e.code() != http::error::need_buffer) {
+            closeUpstream();
+            if (capped) throwHttp(504, "Upstream stream timed out");
+            Impl::throwUpstreamError(e);
+        }
+    }
+    size_t got = n - parser.get().body().size;
+    if (parser.is_done() && idle) lowest->expires_never();
+    co_return std::optional<size_t>(got); // 0 = spurious wake (caller retries)
+}
 
 // ---- shell: plain-function forwarders (never coroutines - no frame may
 // capture the shell this; this is what makes moves safe) ----
@@ -331,33 +317,148 @@ void HttpClient::setConnectTimeout(std::chrono::milliseconds v) { impl_->connect
 void HttpClient::setTotalCap(std::chrono::milliseconds v) { impl_->totalCap = v; }
 void HttpClient::setMaxBodyBytes(size_t v) { impl_->maxBodyBytes = v; }
 
+// Streaming exchange: a thin adapter over the HttpStream session (the only
+// pump implementation lives in Session::head/chunk)
 asio::awaitable<void> HttpClient::exchange(const ParsedUrl& u,
                                            http::request<http::string_body> req,
-                                           ExchangeHandler& handler) {
-    return impl_->exchange(u, std::move(req), handler);
+                                           ExchangeHandler& handler,
+                                           const std::function<void()>& onHardCap) {
+    HttpStream s = open(u, std::move(req), onHardCap);
+    auto* p = co_await s.getHead();
+    auto idle = co_await handler.onHeader(*p);
+    s.setIdle(idle ? *idle : std::chrono::milliseconds(-1));
+
+    while (auto chunk = co_await s.getChunk())
+        co_await handler.onBody(chunk->data(), chunk->size());
+
+    co_await handler.afterBody(); // epilogue still under the cap
+    s.close();                    // disarm + close; the destructor would too
 }
 
-asio::awaitable<http::response<http::string_body>> HttpClient::get(const std::string& url) {
-    return impl_->get(url);
+HttpClient::HttpStream HttpClient::open(const ParsedUrl& u, http::request<http::string_body> req,
+                                        const std::function<void()>& onHardCap) {
+    // defined here (not inside Impl) so the session type is complete; a plain
+    // function - no coroutine keywords, so no frame captures the shell this
+    auto s = std::make_shared<HttpStream::Session>();
+    s->client = impl_.get(); // sslContext()/setupTls/error mapping; stable Impl* (PIMPL)
+    s->url = u;
+    s->req = std::move(req);
+    s->onHardCap = onHardCap;
+    s->connectTimeout = impl_->connectTimeout;
+    s->totalCap = impl_->totalCap;
+    return HttpStream{std::move(s)};
 }
 
+// ---- HttpStream: plain forwarders over the shared session ----
+
+HttpClient::HttpStream::HttpStream(std::shared_ptr<Session> s) noexcept
+    : session_(std::move(s)) {}
+HttpClient::HttpStream::HttpStream(HttpStream&&) noexcept = default;
+HttpClient::HttpStream& HttpClient::HttpStream::operator=(HttpStream&&) noexcept = default;
+
+HttpClient::HttpStream::~HttpStream() {
+    if (session_) session_->closeUpstream(); // destruction implies close()
+}
+
+bool HttpClient::HttpStream::open_() const noexcept { return session_ != nullptr; }
+
+asio::awaitable<http::response_parser<http::buffer_body>*> HttpClient::HttpStream::getHead() {
+    if (!session_ || session_->closed || session_->headDone)
+        throwHttp(500, "HttpStream used out of order", false);
+    co_return co_await session_->head();
+}
+
+asio::awaitable<std::optional<std::string_view>> HttpClient::HttpStream::getChunk() {
+    for (;;) {
+        auto n = co_await session_->chunk(session_->buf, sizeof(session_->buf));
+        if (!n) co_return std::nullopt; // body complete
+        if (*n > 0) co_return std::string_view(session_->buf, *n);
+        // 0 = spurious wake without bytes: read again
+    }
+}
+
+asio::awaitable<std::optional<size_t>>
+HttpClient::HttpStream::getChunk(char* out, size_t n) {
+    if (!session_ || session_->closed) throwHttp(500, "HttpStream used out of order", false);
+    if (n == 0) co_return size_t{0};
+    for (;;) {
+        auto got = co_await session_->chunk(out, n);
+        if (got && *got == 0) continue; // spurious wake without bytes: read again
+        co_return got;
+    }
+}
+
+void HttpClient::HttpStream::close() {
+    if (session_) {
+        session_->closeUpstream(); // closes the upstream, disarms the cap, marks closed
+        session_.reset();          // back to the detached state (open_() == false)
+    }
+}
+
+void HttpClient::HttpStream::setIdle(std::chrono::milliseconds v) {
+    if (v <= std::chrono::milliseconds(0)) session_->idle.reset();
+    else session_->idle = v;
+}
+
+// ---- buffered API: assemble the request, run one session to completion ----
+
+namespace {
 asio::awaitable<http::response<http::string_body>>
-HttpClient::post(const std::string& url, std::string body, const std::string& contentType) {
-    return impl_->post(url, std::move(body), contentType);
-}
+bufferedRun(HttpClient::HttpStream s, size_t maxBodyBytes) {
+    auto* p = co_await s.getHead();
+    BufferedHandler handler{maxBodyBytes}; // buffered: the default afterBody no-op applies
+    auto idle = co_await handler.onHeader(*p);
+    s.setIdle(idle ? *idle : std::chrono::milliseconds(-1));
 
-asio::awaitable<http::response<http::string_body>>
-HttpClient::put(const std::string& url, std::string body, const std::string& contentType) {
-    return impl_->put(url, std::move(body), contentType);
-}
+    while (auto chunk = co_await s.getChunk())
+        co_await handler.onBody(chunk->data(), chunk->size());
 
-asio::awaitable<http::response<http::string_body>> HttpClient::del(const std::string& url) {
-    return impl_->del(url);
+    co_await handler.afterBody();
+    s.close();
+
+    http::response<http::string_body> res{http::status(handler.status), handler.version};
+    for (const auto& [k, v] : handler.headers) res.insert(k, v);
+    res.body() = std::move(handler.body);
+    co_return res;
 }
+} // namespace
 
 asio::awaitable<http::response<http::string_body>>
 HttpClient::request(http::verb method, const std::string& url,
                     std::vector<std::pair<std::string, std::string>> extraHeaders,
                     std::string body) {
-    return impl_->request(method, url, std::move(extraHeaders), std::move(body));
+    auto u = parseUrl(url);
+    if (!u) throwHttp(500, "invalid url", false);
+
+    http::request<http::string_body> req{method, u->target, 11};
+    req.set(http::field::host, u->hostHeader);
+    req.set(http::field::user_agent, "http-client-cpp");
+    for (const auto& [k, v] : extraHeaders) req.set(k, v);
+    req.body() = std::move(body);
+    req.keep_alive(false); // one request per connection (no upstream pooling)
+    req.prepare_payload();
+
+    co_return co_await bufferedRun(open(*u, std::move(req)), impl_->maxBodyBytes);
+}
+
+asio::awaitable<http::response<http::string_body>> HttpClient::get(const std::string& url) {
+    co_return co_await request(http::verb::get, url, {}, "");
+}
+
+asio::awaitable<http::response<http::string_body>>
+HttpClient::post(const std::string& url, std::string body, const std::string& contentType) {
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (!contentType.empty()) headers.emplace_back("content-type", contentType);
+    co_return co_await request(http::verb::post, url, std::move(headers), std::move(body));
+}
+
+asio::awaitable<http::response<http::string_body>>
+HttpClient::put(const std::string& url, std::string body, const std::string& contentType) {
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (!contentType.empty()) headers.emplace_back("content-type", contentType);
+    co_return co_await request(http::verb::put, url, std::move(headers), std::move(body));
+}
+
+asio::awaitable<http::response<http::string_body>> HttpClient::del(const std::string& url) {
+    co_return co_await request(http::verb::delete_, url, {}, "");
 }

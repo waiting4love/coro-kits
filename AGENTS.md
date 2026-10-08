@@ -119,6 +119,18 @@ the calling command line (it kills the caller's own shell).
   must point at objects that outlive `ioc.run()` - never pass temporaries.
   `listen(..., HttpConfig{})` dangles inside the coroutine frame; it
   segfaulted on GCC/Linux while silently passing on Windows/clang.
+- asio has no default-constructed executors: a `steady_timer` member built
+  from an empty `any_io_executor` constructs "successfully" and then throws
+  `bad_executor` on first use (far from the construction site). Use
+  `std::optional<steady_timer>` and emplace once the executor is known
+  (HttpClient's Session does this).
+- `asio::awaitable<T&>` is not representable (the machinery does `new T&`).
+  Coroutine results that are references must travel as pointers.
+- `HttpStream` (src/http_client.hpp) is the single pump: exchange and the
+  buffered API are thin adapters over Session::head/chunk. Do not add a
+  second body-pump implementation. Chunk views from `getChunk()` are valid
+  until the next call - data that must survive goes through the
+  caller-buffer overload `getChunk(char*, size_t)`.
 - `HttpClient` forwarders on the shell must stay plain functions (zero
   coroutine keywords) — a coroutine shell would capture the shell `this` and
   defeat the PIMPL movability. The stable-address rule: no frame may capture
