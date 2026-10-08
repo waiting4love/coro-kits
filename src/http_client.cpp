@@ -76,37 +76,14 @@ void configureTrust(asio::ssl::context& context) {
 #endif
 }
 
-// Buffered-path internal handler: memory guard + body collection + response
-// header recording (hop-by-hop/framing headers stripped). The response is
-// reassembled by request(); framing is not reused (recomputed on this side)
-struct BufferedHandler : HttpClient::ExchangeHandler {
-    size_t maxBytes;
+// Buffered-path result: memory guard + body collection + response header
+// recording (hop-by-hop/framing headers stripped). Filled by bufferedRun;
+// framing is not reused (recomputed on this side)
+struct BufferedResult {
     int status = 200;
     int version = 11;
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
-
-    explicit BufferedHandler(size_t max) : maxBytes(max) {}
-
-    asio::awaitable<std::optional<std::chrono::milliseconds>>
-    onHeader(http::response_parser<http::buffer_body>& p) override {
-        status = (int)p.get().result_int(); // beast returns unsigned; narrowed to int (status-code range)
-        version = (int)p.get().version();
-        for (const auto& h : p.get())
-            if (!hopByHop(h.name_string()))
-                headers.emplace_back(std::string(h.name_string()), std::string(h.value()));
-        if (auto length = p.content_length(); length && *length > maxBytes)
-            throwHttp(502, "Upstream response too large");
-        // No idle timeout: first-byte silence is legitimate generation time;
-        // a hang is caught by the totalCap hard cap
-        co_return std::nullopt;
-    }
-
-    asio::awaitable<void> onBody(const char* data, size_t n) override {
-        if (n > maxBytes - body.size()) throwHttp(502, "Upstream response too large");
-        body.append(data, n);
-        co_return;
-    }
 };
 
 } // namespace
@@ -260,14 +237,18 @@ asio::awaitable<http::response_parser<http::buffer_body>*> HttpClient::HttpStrea
         } // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
 
         // head/body ops only need the lowest layer; read/write over it
-        auto* lowest = tls ? &beast::get_lowest_layer(*tls) : &beast::get_lowest_layer(*plain); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
- // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here
-        co_await http::async_write(*lowest, req, asio::use_awaitable);
-        // lift the default parser limit; body-size guards are the caller's
-        // business (the buffered adapter re-applies maxBodyBytes via its handler)
+        // request/header I/O must go through the real stream: on TLS that is
+        // the ssl stream (it encrypts); the lowest layer only manages deadlines
         parser.body_limit(boost::none);
-        co_await http::async_read_header(*lowest, left, parser, asio::use_awaitable);
-        lowest->expires_never();
+        if (tls) {
+            co_await http::async_write(*tls, req, asio::use_awaitable);
+            co_await http::async_read_header(*tls, left, parser, asio::use_awaitable);
+        } else {
+            co_await http::async_write(*plain, req, asio::use_awaitable); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here (only one is ever used)
+            co_await http::async_read_header(*plain, left, parser, asio::use_awaitable); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here (only one is ever used)
+        }
+        if (tls) beast::get_lowest_layer(*tls).expires_never();
+        else beast::get_lowest_layer(*plain).expires_never(); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here (only one is ever used)
     } catch (const boost::system::system_error& e) {
         closeUpstream();
         if (capped) throwHttp(504, "Upstream stream timed out");
@@ -292,7 +273,10 @@ HttpClient::HttpStream::Session::chunk(char* out, size_t n) {
     parser.get().body().size = n;
     if (idle) lowest->expires_after(*idle);
     try {
-        co_await http::async_read_some(*lowest, left, parser, asio::use_awaitable);
+        // reads go through the real stream (TLS decrypts there), not the
+        // lowest layer - see head()
+        if (tls) co_await http::async_read_some(*tls, left, parser, asio::use_awaitable);
+        else co_await http::async_read_some(*plain, left, parser, asio::use_awaitable); // NOLINT(bugprone-unchecked-optional-access) plain/tls engaged is a session invariant here (only one is ever used)
     } catch (const boost::system::system_error& e) {
         if (e.code() != http::error::need_buffer) {
             closeUpstream();
@@ -316,24 +300,6 @@ HttpClient::~HttpClient() = default;
 void HttpClient::setConnectTimeout(std::chrono::milliseconds v) { impl_->connectTimeout = v; }
 void HttpClient::setTotalCap(std::chrono::milliseconds v) { impl_->totalCap = v; }
 void HttpClient::setMaxBodyBytes(size_t v) { impl_->maxBodyBytes = v; }
-
-// Streaming exchange: a thin adapter over the HttpStream session (the only
-// pump implementation lives in Session::head/chunk)
-asio::awaitable<void> HttpClient::exchange(const ParsedUrl& u,
-                                           http::request<http::string_body> req,
-                                           ExchangeHandler& handler,
-                                           const std::function<void()>& onHardCap) {
-    HttpStream s = open(u, std::move(req), onHardCap);
-    auto* p = co_await s.getHead();
-    auto idle = co_await handler.onHeader(*p);
-    s.setIdle(idle ? *idle : std::chrono::milliseconds(-1));
-
-    while (auto chunk = co_await s.getChunk())
-        co_await handler.onBody(chunk->data(), chunk->size());
-
-    co_await handler.afterBody(); // epilogue still under the cap
-    s.close();                    // disarm + close; the destructor would too
-}
 
 HttpClient::HttpStream HttpClient::open(const ParsedUrl& u, http::request<http::string_body> req,
                                         const std::function<void()>& onHardCap) {
@@ -406,19 +372,28 @@ namespace {
 asio::awaitable<http::response<http::string_body>>
 bufferedRun(HttpClient::HttpStream s, size_t maxBodyBytes) {
     auto* p = co_await s.getHead();
-    BufferedHandler handler{maxBodyBytes}; // buffered: the default afterBody no-op applies
-    auto idle = co_await handler.onHeader(*p);
-    s.setIdle(idle ? *idle : std::chrono::milliseconds(-1));
 
-    while (auto chunk = co_await s.getChunk())
-        co_await handler.onBody(chunk->data(), chunk->size());
+    BufferedResult r;
+    r.status = (int)p->get().result_int(); // beast returns unsigned; narrowed to int (status-code range)
+    r.version = (int)p->get().version();
+    for (const auto& h : p->get())
+        if (!hopByHop(h.name_string()))
+            r.headers.emplace_back(std::string(h.name_string()), std::string(h.value()));
+    if (auto length = p->content_length(); length && *length > maxBodyBytes)
+        throwHttp(502, "Upstream response too large");
+    // No idle budget: first-byte silence is legitimate generation time; a
+    // hang is caught by the totalCap hard cap
 
-    co_await handler.afterBody();
+    while (auto chunk = co_await s.getChunk()) {
+        if (chunk->size() > maxBodyBytes - r.body.size())
+            throwHttp(502, "Upstream response too large");
+        r.body.append(chunk->data(), chunk->size());
+    }
     s.close();
 
-    http::response<http::string_body> res{http::status(handler.status), handler.version};
-    for (const auto& [k, v] : handler.headers) res.insert(k, v);
-    res.body() = std::move(handler.body);
+    http::response<http::string_body> res{http::status(r.status), r.version};
+    for (const auto& [k, v] : r.headers) res.insert(k, v);
+    res.body() = std::move(r.body);
     co_return res;
 }
 } // namespace

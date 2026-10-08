@@ -47,10 +47,12 @@ fall back to `find_package`. Details and gotchas:
   BUILD_INTERFACE generator expressions; boost/version.hpp belongs to the
   config module). The CMake aggregates `Boost::asio/beast/json/url` when
   they exist. Keep this logic.
-- Version floors surface as explanatory FATAL_ERRORs at configure time
-  (Boost 1.81 / OpenSSL 1.1 / SQLite 3.37, best-effort detection) plus
-  static_asserts in src/http_srv.hpp, src/openssl.cpp and src/sqlite.cpp as
-  the authoritative backstop.
+- Version floors: OpenSSL 1.1 / SQLite 3.37 as configure-time
+  FATAL_ERRORs; the Boost 1.81 floor is compile-time only (static_assert in
+  src/http_srv.hpp) - configure-time Boost probing was deliberately removed,
+  the version sources across provisioning shapes were not worth it. The
+  static_asserts in src/http_srv.hpp, src/openssl.cpp and src/sqlite.cpp are
+  authoritative for every provisioning path.
 - demo/tests default OFF when consumed as a subproject (`PROJECT_IS_TOP_LEVEL`).
 - GoogleTest is only fetched under `COROKIT_BUILD_TESTS=ON` (system
   `find_package(GTest CONFIG)` preferred; it forces all components).
@@ -96,6 +98,12 @@ tar --exclude=./build -cf - . | (cd ~/corokit && tar -xf -)
 cd ~/corokit && cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build
 # 47 tests expected (the suite forces all components)
 ```
+The opt-in live-network case (real TLS against mirrors.tuna.tsinghua.edu.cn;
+CN-reachable, handshake-friendly) runs with -DCOROKIT_LIVE_TESTS=ON; the
+default suite stays hermetic. Two gotchas learned there: asio poll() marks
+the context stopped once all work drains - a second drive on the same
+io_context needs ioc.restart() first; and Windows+LibreSSL needs
+SSL_CERT_FILE pointing at a CA bundle for live verification.
 
 WSL also proves the lazy-dependency property of component selection: a
 `-DCOROKIT_INCLUDE_LIBRARIES=sqlite` configure resolves no Boost/OpenSSL at
@@ -126,9 +134,10 @@ the calling command line (it kills the caller's own shell).
   (HttpClient's Session does this).
 - `asio::awaitable<T&>` is not representable (the machinery does `new T&`).
   Coroutine results that are references must travel as pointers.
-- `HttpStream` (src/http_client.hpp) is the single pump: exchange and the
-  buffered API are thin adapters over Session::head/chunk. Do not add a
-  second body-pump implementation. Chunk views from `getChunk()` are valid
+- `HttpStream` (src/http_client.hpp) is the single pump: the buffered API
+  runs over Session::head/chunk. Do not add a second body-pump
+  implementation. (The exchange()/ExchangeHandler callback API was removed
+  on the httpstream-only branch; the pull object replaces it.) Chunk views from `getChunk()` are valid
   until the next call - data that must survive goes through the
   caller-buffer overload `getChunk(char*, size_t)`.
 - `HttpClient` forwarders on the shell must stay plain functions (zero

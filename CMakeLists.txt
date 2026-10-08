@@ -65,6 +65,7 @@ else()
   option(COROKIT_BUILD_TESTS "Build unit tests (forces all components)" OFF)
 endif()
 option(COROKIT_ENABLE_IO_URING "Define BOOST_ASIO_HAS_IO_URING and link uring" OFF)
+option(COROKIT_LIVE_TESTS "Include the live-network http_client tests (real site, real TLS; needs internet)" OFF)
 
 include(FetchContent)
 
@@ -130,9 +131,10 @@ if(COROKIT_WANT_OPENSSL)
   endif()
 endif()
 
-# Boost resolves in two steps: headers/version first, the compiled components
-# only after the version floor check below - so a too-old Boost fails with
-# our explanatory message instead of a confusing "missing: url"
+# Boost floor note: 1.81+ is enforced by the static_assert in
+# src/http_srv.hpp (BOOST_VERSION) - no configure-time probing here, the
+# version sources across provisioning shapes (find_package variable /
+# superproject / pre-provided targets) are not worth the complexity
 set(_boost_components "")
 if(COROKIT_WANT_BOOST)
   list(APPEND _boost_components json)
@@ -140,8 +142,10 @@ if(COROKIT_WANT_BOOST)
     list(APPEND _boost_components url)
   endif()
   list(REMOVE_DUPLICATES _boost_components)
+  # url is a compiled library since Boost 1.81 (Boost.URL's iterator/params
+  # implementations live in libboost_url), not header-only
   if(NOT TARGET Boost::json)
-    find_package(Boost REQUIRED)
+    find_package(Boost REQUIRED COMPONENTS ${_boost_components})
   endif()
 endif()
 
@@ -162,96 +166,13 @@ if("sqlite" IN_LIST COROKIT_COMPONENTS)
   endif()
 endif()
 
-# ---------------------------------------------------------------------------
-# Version floors (configure-time best effort). The static_asserts in
-# src/http_srv.hpp, src/openssl.cpp and src/sqlite.cpp are the authoritative
-# backstop for setups that provide targets without version information.
-# ---------------------------------------------------------------------------
-# Boost version, tried in order: the Boost_VERSION variable (find_package),
-# Boost_SUPERPROJECT_VERSION (superproject), or parsed from boost/version.hpp
-# on the include path of the provided targets (covers alias/prebuilt setups)
-set(COROKIT_BOOST_VERSION "")
-if(NOT COROKIT_WANT_BOOST)
-  # nothing to check
-elseif(DEFINED Boost_VERSION)
-  set(COROKIT_BOOST_VERSION "${Boost_VERSION}")
-elseif(DEFINED Boost_SUPERPROJECT_VERSION)
-  set(COROKIT_BOOST_VERSION "${Boost_SUPERPROJECT_VERSION}")
-else()
-  # Boost::headers carries no include dirs inside a superproject build (they
-  # live on the per-module targets), so collect candidates from all the
-  # Boost targets we know about and parse the first boost/version.hpp found
-  set(_boost_inc "")
-  foreach(_t Boost::headers Boost::config Boost::json Boost::asio Boost::beast Boost::url)
-    if(TARGET ${_t})
-      get_target_property(_dirs ${_t} INTERFACE_INCLUDE_DIRECTORIES)
-      get_target_property(_src ${_t} SOURCE_DIR)
-      if(_dirs)
-        foreach(_d IN LISTS _dirs)
-          if(_d MATCHES "^\\$<BUILD_INTERFACE:(.+)>$")
-            # superproject targets expose their build include path wrapped in
-            # a BUILD_INTERFACE generator expression - unwrap it
-            set(_entry "${CMAKE_MATCH_1}")
-          elseif(_d MATCHES "\\$<")
-            continue() # other generator expressions are not resolvable here
-          else()
-            set(_entry "${_d}")
-          endif()
-          if(NOT IS_ABSOLUTE "${_entry}" AND _src)
-            # relative paths (e.g. "include") resolve against the target's
-            # own source directory
-            set(_entry "${_src}/${_entry}")
-          endif()
-          if(IS_ABSOLUTE "${_entry}")
-            list(APPEND _boost_inc "${_entry}")
-          endif()
-        endforeach()
-      endif()
-    endif()
-  endforeach()
-  foreach(_dir IN LISTS _boost_inc)
-    if(NOT COROKIT_BOOST_VERSION AND EXISTS "${_dir}/boost/version.hpp")
-      file(STRINGS "${_dir}/boost/version.hpp" _version_line
-           REGEX "^[ \t]*#[ \t]*define[ \t]+BOOST_VERSION[ \t]+[0-9]+")
-      if(_version_line)
-        # CMake REGEX has no {n} intervals; BOOST_VERSION lines carry
-        # exactly one digit run (e.g. "#define BOOST_VERSION 108700")
-        string(REGEX MATCH "[0-9]+" _raw "${_version_line}")
-        if(_raw)
-          math(EXPR _major "${_raw} / 100000")
-          math(EXPR _minor "(${_raw} / 100) % 1000")
-          set(COROKIT_BOOST_VERSION "${_major}.${_minor}")
-        endif()
-      endif()
-    endif()
-  endforeach()
-endif()
-
+# Boost header aggregation (after all component targets exist): for an
+# installed Boost or FindBoost, Boost::headers is the full include set; but
+# inside a Boost superproject (in-tree FetchContent build) it is an empty
+# pseudo-library and the include dirs live on the per-module targets - so
+# aggregate them one by one where they exist; both shapes end up with
+# complete header paths
 if(COROKIT_WANT_BOOST)
-  if(COROKIT_BOOST_VERSION)
-    if(COROKIT_BOOST_VERSION VERSION_LESS 1.81)
-      message(FATAL_ERROR
-        "coro-kit requires Boost >= 1.81 (Boost.URL; tested with 1.83 and 1.87), "
-        "but found Boost ${COROKIT_BOOST_VERSION}. Provide a newer Boost to your "
-        "project: upgrade the installed package, or FetchContent a newer Boost "
-        "superproject before pulling in coro-kit.")
-    endif()
-    message(STATUS "coro-kit: Boost ${COROKIT_BOOST_VERSION} (floor 1.81)")
-  else()
-    message(STATUS "coro-kit: Boost version not detectable (pre-provided targets); floor is 1.81")
-  endif()
-
-  if(NOT TARGET Boost::json)
-    # url is a compiled library since Boost 1.81 (Boost.URL's iterator/params
-    # implementations live in libboost_url), not header-only
-    find_package(Boost REQUIRED COMPONENTS ${_boost_components})
-  endif()
-  # Boost header aggregation (after all component targets exist): for an
-  # installed Boost or FindBoost, Boost::headers is the full include set; but
-  # inside a Boost superproject (in-tree FetchContent build) it is an empty
-  # pseudo-library and the include dirs live on the per-module targets - so
-  # aggregate them one by one where they exist; both shapes end up with
-  # complete header paths
   set(COROKIT_BOOST_LINK Boost::headers Boost::json)
   foreach(comp IN ITEMS asio beast url)
     if(TARGET Boost::${comp})
@@ -403,6 +324,11 @@ if(COROKIT_BUILD_TESTS)
   )
   target_link_libraries(corokit-tests PRIVATE corokit::corokit GTest::gtest_main)
   target_compile_definitions(corokit-tests PRIVATE KEYS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/keys")
+  if(COROKIT_LIVE_TESTS)
+    # opt-in live-network cases (see the bottom of test/test_http_client.cpp);
+    # the default suite stays hermetic and network-free
+    target_compile_definitions(corokit-tests PRIVATE COROKIT_LIVE_TESTS=1)
+  endif()
   corokit_target_flags(corokit-tests)
 
   enable_testing()

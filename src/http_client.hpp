@@ -12,20 +12,22 @@
 //     throw HttpError 502/504; redirects are not followed; the returned
 //     response has hop-by-hop/framing headers stripped (safe to forward;
 //     framing is recomputed on this side)
-//   - Streaming exchange: an ExchangeHandler (interface) receives the
-//     headers on arrival (may commit client response headers, e.g. for
-//     SSE), gets body chunks one by one, plus lifecycle hooks (afterBody
-//     epilogue / onHardCap abort); business exceptions propagate untouched.
+//   - Streaming object (HttpStream, via open()): the caller drives the
+//     exchange step by step - getHead() yields the live parser, getChunk()
+//     pulls body chunks one by one, and the epilogue (e.g. an SSE
+//     last-chunk write) runs before close(), still under the hard cap.
 //     Upstream URL and request assembly are entirely the caller's business.
 //
 // Timeout model (mirrors Node's AbortController plus a body-stage anti-hang
 // guard):
 //   connectTimeout budgets resolve+connect+TLS handshake+request write+
-//   response-header read as one; the body-stage rolling idle timeout is
-//   decided by the handler's onHeader return value (the buffered path
-//   returns nullopt: first-byte silence is legitimate generation time);
+//   response-header read as one; the body-stage rolling idle timeout is set
+//     via HttpStream::setIdle after getHead() (the buffered path leaves it
+//     unlimited: first-byte silence is legitimate generation time);
 //   totalCap is a hard overall cap - on expiry the upstream socket is force
-//   closed (onHardCap decides whether the client connection goes too) -> 504.
+//     closed and the suspended co_await throws HttpError 504 (the onHardCap
+//     hook passed to open() fires first, to unblock a stalled client socket
+//     the exchange itself might be waiting on).
 //
 // Movable (PIMPL): all state and coroutine machinery live in Impl inside
 // the .cpp, and a Impl address is stable for life - a move only carries the
@@ -33,9 +35,8 @@
 // references all land on Impl, so moving the shell dangles nothing.
 // Copying stays forbidden; a moved-from shell may only be destructed or
 // re-assigned. Shell forwarders are plain functions (never coroutines), so
-// no frame ever captures the shell this; with the interface-based handler,
-// exchange is no longer a template either - the implementation sinks
-// entirely into the .cpp and this header carries contracts only.
+// no frame ever captures the shell this - the implementation sinks entirely
+// into the .cpp and this header carries contracts only.
 //
 // Ownership and concurrency (single-threaded io_context rule):
 //   - no io_context is held: coroutines take the executor via
@@ -78,38 +79,6 @@ bool hopByHop(std::string_view name);
 
 class HttpClient {
 public:
-    // Streaming exchange handler: the event contract of one exchange. The
-    // implementation must outlive the exchange (passed by reference,
-    // non-owning). Happy-path order: onHeader -> onBody* -> afterBody;
-    // onHardCap fires only on the abort path (totalCap expiry), after which
-    // the exchange fails with 504 and afterBody is skipped.
-    struct ExchangeHandler {
-        virtual ~ExchangeHandler() = default;
-
-        // Response headers arrived (before the body); returns the rolling
-        // idle timeout for the body stage (nullopt = unlimited, totalCap is
-        // the safety net). May commit client response headers here, or
-        // throw a business exception to abort the exchange
-        virtual asio::awaitable<std::optional<std::chrono::milliseconds>>
-        onHeader(http::response_parser<http::buffer_body>& p) = 0;
-
-        // One non-empty body chunk; may throw a business exception to abort
-        // the exchange
-        virtual asio::awaitable<void> onBody(const char* data, size_t n) = 0;
-
-        // Body fully pumped, before the hard cap is disarmed (SSE: the
-        // last-chunk write stays under the cap, guarding against a
-        // zero-window client deadlock). Default: no-op
-        virtual asio::awaitable<void> afterBody() { co_return; }
-
-        // The hard overall cap fired: the upstream socket is already being
-        // force-closed; tear down anything else that must go with it (e.g.
-        // the client socket once SSE headers are committed; keep it
-        // otherwise so a 504 can still be sent). Called synchronously from
-        // a timer completion handler - must not throw. Default: no-op
-        virtual void onHardCap() {}
-    };
-
     HttpClient();                        // Impl assembly lives in http_client.cpp
     HttpClient(HttpClient&&) noexcept;   // carries only the unique_ptr; Impl stays put
     HttpClient& operator=(HttpClient&&) noexcept;
@@ -122,15 +91,7 @@ public:
     void setTotalCap(std::chrono::milliseconds v);       // hard overall cap; <=0 disables
     void setMaxBodyBytes(size_t v);                      // buffered-path memory guard
 
-    // Streaming exchange (event contract: ExchangeHandler). onHardCap fires
-    // when the total cap does, before the 504 surfaces: use it to unblock
-    // anything this exchange might be suspended on (e.g. a stalled
-    // zero-window client socket in self-write mode)
-    asio::awaitable<void> exchange(const ParsedUrl& u, http::request<http::string_body> req,
-                                   ExchangeHandler& handler,
-                                   const std::function<void()>& onHardCap = {});
-
-    // ---- streaming object (pull style; the other two APIs are adapters over it) ----
+    // ---- streaming object (pull style; the buffered API runs on it too) ----
 
     // One streamed exchange. Acquire with HttpClient::open(), then:
     //   auto& head = co_await s.getHead();   // resolve+connect(+TLS)+request+headers,

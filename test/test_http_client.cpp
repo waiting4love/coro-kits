@@ -1,17 +1,19 @@
 // HttpClient unit tests: an embedded Router server (127.0.0.1, ephemeral
-// port, fully offline); each case drives the io_context (poll loop) until
-// the client coroutine finishes.
+// port, fully offline); each case drives the io_context (poll loop) until the
+// client coroutine finishes.
 // Note: the closure of a coroutine lambda must stay alive by name until the
 // coroutine finishes (closures are not copied into coroutine frames; an
 // immediately-invoked temporary dangles its captures).
-// The full https handshake chain (SNI/certificate verification/trust
-// sources/fail-closed) is covered by end-to-end tests with a temporary CA
-// and a TLS mock; no certificate infrastructure is duplicated here - only
-// URL parsing and the buffered http paths.
+// The https handshake chain against a temporary CA and a TLS mock is covered
+// by end-to-end tests elsewhere; URL parsing and the buffered/http paths are
+// covered here. One opt-in live-network case (real site, real TLS) lives at
+// the bottom: it is only registered when COROKIT_LIVE_TESTS=1 is set, so the
+// default suite stays hermetic and network-free.
 
 #include "http_client.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <stdexcept>
 #include <string>
@@ -21,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include "http_srv.hpp" // Router/listen: the embedded test server
+
 
 namespace {
 
@@ -36,10 +39,15 @@ using namespace std::chrono_literals;
 // function's scope removes the "temporary closure dies first" trap at the
 // API level
 template <class MakeClient>
-auto drive(asio::io_context& ioc, MakeClient&& makeClient) {
+auto drive(asio::io_context& ioc, MakeClient&& makeClient,
+           std::chrono::steady_clock::duration budget = std::chrono::seconds(10)) {
     auto client = makeClient();
     auto fut = asio::co_spawn(ioc, std::move(client), asio::use_future);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    // a poll() loop that drains all outstanding work marks the context
+    // stopped; a later drive on the same ioc must restart it first (the
+    // live test drives one ioc twice)
+    if (ioc.stopped()) ioc.restart();
+    const auto deadline = std::chrono::steady_clock::now() + budget;
     while (fut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
         if (std::chrono::steady_clock::now() > deadline) {
             ioc.stop();
@@ -91,35 +99,7 @@ auto statusOf(HttpClient& hc, std::string url) {
     };
 }
 
-// Makes the handler contract observable: records every
-// onHeader/onBody/afterBody invocation
-struct RecordingHandler : HttpClient::ExchangeHandler {
-    std::string body;
-    int status = 0;
-    int headers = 0;
-    int chunks = 0;
-    int afterBodies = 0;
-
-    asio::awaitable<std::optional<std::chrono::milliseconds>>
-    onHeader(http::response_parser<http::buffer_body>& p) override {
-        ++headers;
-        status = (int)p.get().result_int();
-        co_return std::nullopt; // no idle timeout needed here
-    }
-
-    asio::awaitable<void> onBody(const char* data, size_t n) override {
-        ++chunks;
-        body.append(data, n);
-        co_return;
-    }
-
-    asio::awaitable<void> afterBody() override {
-        ++afterBodies;
-        co_return;
-    }
-};
-
-// Minimal GET request for exchange() against the test server
+// Minimal GET request for open() against the test server
 http::request<http::string_body> getRequest(const ParsedUrl& u) {
     http::request<http::string_body> req{http::verb::get, u.target, 11};
     req.set(http::field::host, u.hostHeader);
@@ -284,67 +264,6 @@ TEST(HttpClientTest, ShellMoveDuringFlight) {
     EXPECT_EQ(second.body(), "again"); // the destination owns the same Impl and can keep issuing requests
 }
 
-TEST(HttpClientTest, StreamingExchangeHappyPathEvents) {
-    // happy-path order: onHeader once -> onBody per chunk -> afterBody
-    // exactly once; onHardCap never fires
-    TestServer srv;
-    srv.router.add(http::verb::get, "/stream", [](Ctx& ctx) -> asio::awaitable<void> {
-        ctx.res.set(http::field::content_type, "text/plain");
-        ctx.res.body() = "hello streaming world";
-        co_return;
-    });
-    srv.start();
-
-    HttpClient hc;
-    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<std::string> {
-        RecordingHandler h; // lives in this frame, outliving the exchange it is passed to
-        auto u = parseUrl(base + "/stream");
-        if (!u) throwHttp(500, "bad url");
-        int hardCaps = 0;
-        co_await hc.exchange(*u, getRequest(*u), h, [&] { ++hardCaps; });
-        EXPECT_EQ(h.headers, 1);
-        EXPECT_EQ(h.status, 200);
-        EXPECT_GT(h.chunks, 0);
-        EXPECT_EQ(h.afterBodies, 1);
-        EXPECT_EQ(hardCaps, 0);
-        co_return h.body;
-    };
-    EXPECT_EQ(srv.run(call), "hello streaming world");
-}
-
-TEST(HttpClientTest, StreamingExchangeHardCapAborts) {
-    // abort path: totalCap fires -> the unblock hook runs (before the
-    // 504 surfaces); afterBody is skipped
-    TestServer srv;
-    srv.router.add(http::verb::get, "/hang", [](Ctx& ctx) -> asio::awaitable<void> {
-        (void)ctx;
-        asio::steady_timer timer(co_await asio::this_coro::executor);
-        timer.expires_after(2s); // far beyond totalCap: the hard cap force-closes
-        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-        ctx.json(200, json::object{{"ok", true}});
-        co_return;
-    });
-    srv.start();
-
-    HttpClient hc;
-    hc.setTotalCap(50ms);
-    auto call = [&hc, base = srv.baseUrl()]() -> asio::awaitable<int> {
-        RecordingHandler h;
-        int hardCaps = 0;
-        auto u = parseUrl(base + "/hang");
-        if (!u) throwHttp(500, "bad url");
-        try {
-            co_await hc.exchange(*u, getRequest(*u), h, [&] { ++hardCaps; });
-            co_return 0;
-        } catch (const HttpError& e) {
-            EXPECT_EQ(hardCaps, 1);      // fired before the 504 surfaced
-            EXPECT_EQ(h.afterBodies, 0); // abort path skips the epilogue
-            co_return e.status;
-        }
-    };
-    EXPECT_EQ(srv.run(call), 504);
-}
-
 TEST(HttpClientTest, StreamObjectHappyPath) {
     // the object API end to end: lazy open, getHead (parser visible),
     // view-mode chunks, explicit close; the hard-cap hook never fires
@@ -494,5 +413,58 @@ TEST(HttpClientTest, InvalidUrl500) {
     HttpClient hc;
     EXPECT_EQ(drive(ioc, statusOf(hc, "not a url")), 500);
 }
+
+// ---- opt-in live-network case (real site, real TLS) ----
+// Registered only when COROKIT_LIVE_TESTS=1: the default suite stays hermetic
+// (repeatable, offline-safe, fast); this case is for manual runs and machines
+// with internet access. The target is the TUNA mirror service: reachable from
+// mainland China without a proxy (unlike, say, Google), tolerant of repeated
+// handshakes (unlike cppreference, which throttles back-to-back TLS), and
+// serving a stable real page. Assertions are deliberately loose - status and
+// a signature substring only, never page content (the site rewrites itself).
+#ifdef COROKIT_LIVE_TESTS
+
+// Both fetches in ONE case on purpose: the site rate-limits rapid
+// back-to-back TLS handshakes, so separate ctest invocations seconds apart
+// flake; a single process keeps the two connections naturally spaced
+TEST(HttpClientLive, HttpsHomepage) {
+    asio::io_context ioc;
+    HttpClient hc;
+    hc.setConnectTimeout(std::chrono::seconds(10));
+    hc.setTotalCap(std::chrono::seconds(30));
+
+    // buffered fetch over real TLS (DNS, SNI, chain verification, framing)
+    auto buffered = [&hc]() -> asio::awaitable<int> {
+        auto res = co_await hc.get("https://mirrors.tuna.tsinghua.edu.cn");
+        EXPECT_EQ(res.result(), http::status::ok);
+        // a stable signature of the real page (title block), not its content
+        EXPECT_NE(res.body().find("tuna"), std::string::npos);
+        co_return 0;
+    };
+    EXPECT_EQ(drive(ioc, buffered, std::chrono::seconds(30)), 0);
+
+    // the pull object over real TLS: parser visible, chunks reassembled,
+    // the stream completes and closes cleanly
+    auto pulled = [&hc]() -> asio::awaitable<int> {
+        auto u = parseUrl("https://mirrors.tuna.tsinghua.edu.cn");
+        if (!u) throwHttp(500, "bad url");
+        http::request<http::string_body> req{http::verb::get, u->target, 11};
+        req.set(http::field::host, u->hostHeader);
+        req.set(http::field::user_agent, "corokit-live-test");
+        req.prepare_payload();
+
+        auto s = hc.open(*u, std::move(req));
+        auto* head = co_await s.getHead();
+        EXPECT_EQ(head->get().result_int(), 200);
+        size_t total = 0;
+        while (auto chunk = co_await s.getChunk()) total += chunk->size();
+        EXPECT_GT(total, size_t{1000}); // the landing page is ~22KB
+        s.close();
+        co_return 0;
+    };
+    EXPECT_EQ(drive(ioc, pulled, std::chrono::seconds(30)), 0);
+}
+
+#endif // COROKIT_LIVE_TESTS
 
 } // namespace

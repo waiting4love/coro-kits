@@ -17,7 +17,7 @@ ctx/router、jsonwebtoken 的错误分类、Buffer.from 的宽容 base64）。
 | 模块 | 组件 | 文件 | 职责 |
 |---|---|---|---|
 | HTTP 服务框架 | `corokit::http_srv` | `http_srv.hpp/.cpp`、`http_config.hpp`、`error.hpp` | 监听、路由（静态段 / `:param` / `*` 尾通配）、405+Allow、静态资源 + SPA fallback、Cookie、SSE 流式响应、中央错误处理 → JSON、CORS 预检 |
-| 出站 HTTP 客户端 | `corokit::http_client` | `http_client.hpp/.cpp` | 缓冲式 `get/post/put/del/request` + 流式 `exchange`（handler 接口）与 `HttpStream` 拉式对象（getHead/getChunk，其余两者的共同底座）；TLS（SNI、证书链与 DNS/IP 身份验证）、两级超时（建连预算 + 总时长硬顶 + body 滚动空闲）、PIMPL 可移动 |
+| 出站 HTTP 客户端 | `corokit::http_client` | `http_client.hpp/.cpp` | 缓冲式 `get/post/put/del/request` + 流式 `HttpStream` 拉式对象（open/getHead/getChunk/close，buffered 的底座）；TLS（SNI、证书链与 DNS/IP 身份验证）、两级超时（建连预算 + 总时长硬顶 + body 滚动空闲）、PIMPL 可移动 |
 | JWT | `corokit::jwt` | `jwt.hpp/.cpp` | RS256 验签 / 签发；`TokenExpiredError` / `NotBeforeError` / `JsonWebTokenError` 错误名与 [jsonwebtoken](https://github.com/auth0/node-jsonwebtoken) 对齐 |
 | OpenSSL RAII | `corokit::openssl` | `openssl.hpp/.cpp` | `openssl::Key`（EVP_PKEY 统一层）、`signRsaSha256/verifyRsaSha256`、PKCS#1 v1.5 分块加解密、`randomBytes`；业务代码不触碰裸 C API |
 | SQLite RAII | `corokit::sqlite` | `sqlite.hpp/.cpp` | `Db` / `Statement` / `Transaction`；语句一次 prepare 长期复用、事务不显式 commit 析构即回滚、约束冲突抛 `ConstraintError` 子类 |
@@ -62,11 +62,10 @@ target_link_libraries(your-app PRIVATE corokit::http_client)  # 按需链组件�
 **依赖约定**：库被引入时，若下列 target 已存在则直接复用；不存在才回退系统
 `find_package`——所以"你工程里已有的"就是"coro-kit 用的"：
 
-版本过低会在 configure 期得到一条说明原因与出路的 FATAL_ERROR（Boost
-版本从 `Boost_VERSION` 变量、超级项目变量或 `boost/version.hpp` 三处探
-测，别名/预编译场景也覆盖）；源码里另有 static_assert 兜底（`http_srv.hpp` /
-`openssl.cpp` / `sqlite.cpp`），对所有供依赖方式权威。探测到版本时
-configure 输出一行 `coro-kit: Boost x.y (floor 1.81)` 供确认。
+版本下限：OpenSSL/LibreSSL ≥ 1.1 与 SQLite ≥ 3.37 在 configure 期以
+FATAL_ERROR 提示；Boost ≥ 1.81 不做 configure 期探测（跨供依赖形态的版本
+来源太杂），由源码里的 static_assert（`http_srv.hpp` / `openssl.cpp` /
+`sqlite.cpp`）统一兜底——对所有供依赖方式权威。
 
 | 库需要的 target | 回退解析 | 说明 |
 |---|---|---|
@@ -209,25 +208,7 @@ auto res = co_await http.get("https://example.com/api");
 // 返回的响应已剥逐跳/定界头，转发复用安全
 ```
 
-流式（SSE 透传等）实现 `HttpClient::ExchangeHandler` 接口——`onHeader` 在响应头
-到达时调用（返回 body 阶段的滚动空闲超时），`onBody` 逐块回调：
-
-```cpp
-struct Relay : HttpClient::ExchangeHandler {
-    Ctx& ctx;
-    asio::awaitable<std::optional<std::chrono::milliseconds>>
-    onHeader(http::response_parser<http::buffer_body>& p) override {
-        co_await ctx.beginSse((int)p.get().result_int());
-        co_return std::chrono::milliseconds(15000); // nullopt = 不限空闲
-    }
-    asio::awaitable<void> onBody(const char* data, size_t n) override {
-        co_await ctx.writeChunk(std::string_view(data, n));
-        co_return;
-    }
-};
-```
-
-需要**拉式消费**时用 `HttpStream` 对象（exchange/buffered 内部也跑在它上面）——
+流式消费用 `HttpStream` 拉式对象（buffered API 内部也跑在它上面）——
 `getHead` 后解析器可见（状态/头任取），`getChunk` 逐块拉取；总硬顶到点时以
 `HttpError 504` 异常从挂起的 `co_await` 处冒出，`open` 的 `onHardCap` 参数在
 异常前触发（解阻塞自写模式下卡死的客户端 socket）：
@@ -315,6 +296,18 @@ coro-kit/
 ```bash
 ctest --test-dir build --output-on-failure
 ```
+
+另有一个**默认不参与**的活网用例（真实站点、真实 TLS：DNS/SNI/证书链验证/真页面，
+覆盖 mock 测不到的执行级链路）：
+
+```bash
+cmake -S . -B build -DCOROKIT_LIVE_TESTS=ON && cmake --build build
+ctest --test-dir build -R HttpsHomepage
+# Windows + LibreSSL 需给信任源：SSL_CERT_FILE=<CA bundle 路径>（如 Git 自带的
+# mingw64/etc/ssl/certs/ca-bundle.crt）；Linux/macOS 系统路径原生可用
+```
+
+目标选型考虑了国内网络：清华 TUNA 镜像（无需代理可达、不限连发握手、页面稳定）。
 
 覆盖：路由匹配/参数/405、Cookie 序列化、base64 RFC 4648 向量与宽容解码、
 JWT 全错误分类（含算法混淆/篡改签名）、.NET XML 密钥加载、出站客户端的
