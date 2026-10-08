@@ -1,4 +1,5 @@
 #include "http_client.hpp"
+#include "error.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -7,8 +8,9 @@
 #include <utility>
 
 #include <boost/asio/ssl.hpp>
-
+#include <boost/url.hpp> // origin-form parsing: decoded path segments and query params
 #include <openssl/ssl.h> // SSL_set_tlsext_host_name: no asio wrapper for SNI (single bare-openssl exception)
+
 
 std::optional<ParsedUrl> parseUrl(const std::string& url) {
     auto r = boost::urls::parse_absolute_uri(url);
@@ -94,8 +96,7 @@ struct BufferedResult {
 // shell's unique_ptr); frames of in-flight coroutines and the references
 // held by ssl::stream all land on stable addresses inside Impl ----
 
-class HttpClient::Impl {
-public:
+struct HttpClient::Impl {
     // ---- configuration (written by shell setters at assembly time) ----
     std::chrono::milliseconds connectTimeout{10000}; // one budget for resolve~response-header read
     std::chrono::milliseconds totalCap{60000};       // hard overall cap; <=0 disables
@@ -128,8 +129,6 @@ public:
         upstream.set_verify_mode(asio::ssl::verify_peer);
         upstream.set_verify_callback(asio::ssl::host_name_verification(host));
     }
-
-    static constexpr size_t kReadBuf = 16384;
 
     std::optional<asio::ssl::context> sslc_; // lazily initialized on first https, then reused read-only
 };

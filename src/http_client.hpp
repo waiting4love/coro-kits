@@ -50,15 +50,19 @@
 //     (single-threaded SSL_CTX sharing across streams is safe; verify mode
 //     and SNI live on the stream, not the context)
 
-#include <chrono>
-#include <cstddef>
-#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
 
-#include "http_srv.hpp"
+#include <chrono>
+#include <cstddef>
+#include <memory>
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace asio = boost::asio;
 
 // Parses an absolute URL. Anything but http/https is treated as non-tls
 // (default port 80, matching the legacy upstream behavior); callers wanting

@@ -31,7 +31,7 @@ std::string readFileOrThrow(const std::string& path) {
 std::optional<std::string> bytesFromB64Text(const std::string& b64Text) {
     auto bytes = b64::Base64Std::decode(b64Text);
     if (!bytes || bytes->empty()) return std::nullopt;
-    return std::move(*bytes);
+    return bytes;
 }
 
 // Extracts an optional private parameter (P/Q/DP/DQ/InverseQ): missing or invalid -> nullopt

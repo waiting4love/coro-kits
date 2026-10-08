@@ -6,19 +6,20 @@
 // ctx.res is the single response object: routes, static files and errors all
 // fill it in place; the framework never replaces it.
 
-#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
-
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+
+#include <map>
+#include <vector>
+
 #include <boost/json.hpp>
 #include <boost/url.hpp> // origin-form parsing: decoded path segments and query params
 #include <boost/version.hpp>
 
-#include "error.hpp"
+#include "error.hpp" // public: business handlers throw HttpError (Koa err.status semantics)
 #include "http_config.hpp"
 
 // Authoritative backstop for the configure-time version hints in

@@ -1,6 +1,5 @@
 #include "jwt.hpp"
 
-#include <chrono>
 #include <ctime>
 #include <string>
 #include <vector>

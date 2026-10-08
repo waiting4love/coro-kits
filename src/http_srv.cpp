@@ -1,4 +1,5 @@
 #include "http_srv.hpp"
+#include "error.hpp"
 
 #include <algorithm>
 #include <cctype>

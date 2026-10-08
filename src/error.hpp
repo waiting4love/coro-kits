@@ -4,7 +4,6 @@
 
 #include <stdexcept>
 #include <string>
-#include <utility>
 
 struct HttpError : std::runtime_error {
     int status;   // HTTP status code

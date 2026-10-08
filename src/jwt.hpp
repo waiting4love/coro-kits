@@ -11,12 +11,12 @@
 // Error names match jsonwebtoken: TokenExpiredError / NotBeforeError /
 // JsonWebTokenError, ready for API response details.
 
+#include "openssl.hpp"
+
 #include <stdexcept>
 #include <string>
 
 #include <boost/json.hpp>
-
-#include "key_loader.hpp" // brings in openssl.hpp (openssl::Key)
 
 struct JwtVerifyError : std::runtime_error {
     std::string name; // TokenExpiredError / NotBeforeError / JsonWebTokenError
