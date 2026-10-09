@@ -27,9 +27,12 @@ examples/consumer/   # consumer sample = migration template: pins LibreSSL + Boo
 
 Components (Boost-style; consumers set `COROKIT_INCLUDE_LIBRARIES` before
 pulling this project in, unset/empty = all): `b64` (header-only), `openssl`,
-`sqlite`, `key_loader` (-> openssl), `jwt` (-> key_loader + Boost.json),
-`http_srv` (src/http_srv.hpp/.cpp + http_config.hpp + error.hpp), `http_client`
-(-> http_srv + OpenSSL for upstream TLS), plus the `corokit::corokit` umbrella.
+`sqlite`, `key_loader` (-> openssl), `jwt` (-> openssl + b64 + Boost.json;
+.NET XML key loading is the consumer's concern - link key_loader and include
+key_loader.hpp explicitly), `http_srv` (src/http_srv.hpp/.cpp +
+http_config.hpp + error.hpp), `http_client` (-> Boost.url + OpenSSL for
+upstream TLS; header-only error.hpp resolves via the shared src include dir),
+plus the `corokit::corokit` umbrella.
 Dependency resolution is lazy per component: a sqlite-only consumer never
 triggers Boost/OpenSSL lookups. Note the module was renamed http -> http_srv
 (headers included as "http_srv.hpp").

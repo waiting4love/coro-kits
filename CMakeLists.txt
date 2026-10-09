@@ -12,10 +12,10 @@
 #   corokit::openssl      openssl.hpp/.cpp                          - OpenSSL/LibreSSL >= 1.1 (crypto)
 #   corokit::sqlite       sqlite.hpp/.cpp                           - SQLite >= 3.37
 #   corokit::key_loader   key_loader.hpp/.cpp                       - corokit::openssl, b64
-#   corokit::jwt          jwt.hpp/.cpp                              - corokit::key_loader, Boost::json
+#   corokit::jwt          jwt.hpp/.cpp                              - corokit::openssl, b64, Boost::json
 #   corokit::http_srv     http_srv.hpp/.cpp, http_config.hpp, error.hpp
 #                                                                   - Boost (asio/beast/json/url), Threads
-#   corokit::http_client  http_client.hpp/.cpp                      - corokit::http_srv, OpenSSL (TLS upstream)
+#   corokit::http_client  http_client.hpp/.cpp                      - Boost.url (asio/beast header-only), OpenSSL (TLS upstream)
 #   corokit::corokit      umbrella over everything selected
 #
 # Dependency policy: nothing is pinned. Per-component contract - a target
@@ -92,12 +92,12 @@ endforeach()
 set(COROKIT_COMPONENTS ${COROKIT_INCLUDE_LIBRARIES})
 foreach(_c IN LISTS COROKIT_INCLUDE_LIBRARIES)
   if(_c STREQUAL "jwt")
-    list(APPEND COROKIT_COMPONENTS key_loader openssl b64)
+    list(APPEND COROKIT_COMPONENTS openssl b64)   # openssl::Key + header-only base64url
   elseif(_c STREQUAL "key_loader")
     list(APPEND COROKIT_COMPONENTS openssl b64)
-  elseif(_c STREQUAL "http_client")
-    list(APPEND COROKIT_COMPONENTS http_srv)
   endif()
+  # http_client: no transitive deps - error.hpp is header-only (shared src
+  # include dir), Boost.url is linked by the http_client target itself
 endforeach()
 list(REMOVE_DUPLICATES COROKIT_COMPONENTS)
 message(STATUS "coro-kit components: ${COROKIT_COMPONENTS}")
@@ -137,14 +137,19 @@ endif()
 # superproject / pre-provided targets) are not worth the complexity
 set(_boost_components "")
 if(COROKIT_WANT_BOOST)
-  list(APPEND _boost_components json)
+  if("http_srv" IN_LIST COROKIT_COMPONENTS OR "jwt" IN_LIST COROKIT_COMPONENTS)
+    list(APPEND _boost_components json)
+  endif()
   if("http_srv" IN_LIST COROKIT_COMPONENTS OR "http_client" IN_LIST COROKIT_COMPONENTS)
     list(APPEND _boost_components url)
   endif()
   list(REMOVE_DUPLICATES _boost_components)
   # url is a compiled library since Boost 1.81 (Boost.URL's iterator/params
-  # implementations live in libboost_url), not header-only
-  if(NOT TARGET Boost::json)
+  # implementations live in libboost_url), not header-only. Per-component
+  # gate: only find_package when a needed target is still missing (e.g.
+  # http_client alone needs Boost::url but not Boost::json)
+  if(("json" IN_LIST _boost_components AND NOT TARGET Boost::json)
+     OR ("url" IN_LIST _boost_components AND NOT TARGET Boost::url))
     find_package(Boost REQUIRED COMPONENTS ${_boost_components})
   endif()
 endif()
@@ -179,6 +184,11 @@ if(COROKIT_WANT_BOOST)
       list(APPEND COROKIT_BOOST_LINK Boost::${comp})
     endif()
   endforeach()
+  # http_client (decoupled from http_srv) needs url but not json: linking
+  # json would hand http_client-only consumers a superfluous libboost_json
+  # runtime dependency
+  set(COROKIT_BOOST_CLIENT_LINK ${COROKIT_BOOST_LINK})
+  list(REMOVE_ITEM COROKIT_BOOST_CLIENT_LINK Boost::json)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -240,8 +250,9 @@ if("jwt" IN_LIST COROKIT_COMPONENTS)
   add_library(corokit::jwt ALIAS corokit_jwt)
   target_compile_features(corokit_jwt PUBLIC cxx_std_20)
   target_include_directories(corokit_jwt PUBLIC ${COROKIT_INC})
-  # jwt.hpp exposes key_loader.hpp and boost/json.hpp
-  target_link_libraries(corokit_jwt PUBLIC corokit_key_loader ${COROKIT_BOOST_LINK})
+  # jwt.hpp exposes openssl.hpp (openssl::Key) and boost/json.hpp; .NET XML
+  # key loading is the consumer's concern (corokit::key_loader + key_loader.hpp)
+  target_link_libraries(corokit_jwt PUBLIC corokit_openssl Boost::headers Boost::json)
   corokit_target_flags(corokit_jwt)
 endif()
 
@@ -264,9 +275,11 @@ if("http_client" IN_LIST COROKIT_COMPONENTS)
   add_library(corokit::http_client ALIAS corokit_http_client)
   target_compile_features(corokit_http_client PUBLIC cxx_std_20)
   target_include_directories(corokit_http_client PUBLIC ${COROKIT_INC})
-  # http_client.hpp includes http_srv.hpp (Boost types) and does TLS upstream
+  # Decoupled from http_srv: header-only error.hpp resolves via the shared
+  # src include dir; Boost needs only url (asio/beast are header-only).
+  # TLS upstream → OpenSSL::SSL
   target_link_libraries(corokit_http_client PUBLIC
-    corokit_http_srv
+    ${COROKIT_BOOST_CLIENT_LINK}
     OpenSSL::SSL
     OpenSSL::Crypto
   )

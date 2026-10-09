@@ -39,7 +39,7 @@ target_link_libraries(your-app PRIVATE corokit::http_client)  # 按需链组件�
 
 **组件选择对齐 Boost 的 `BOOST_INCLUDE_LIBRARIES`**：引入前设置
 `COROKIT_INCLUDE_LIBRARIES` 即可，选择会自动展开到传递闭包（如 `jwt` 自带
-`key_loader`、`openssl`）；未知组件名直接报错并列出合法值。各组件与额外依赖：
+`openssl`）；未知组件名直接报错并列出合法值。各组件与额外依赖：
 
 | 组件 | 额外依赖 |
 |---|---|
@@ -47,9 +47,9 @@ target_link_libraries(your-app PRIVATE corokit::http_client)  # 按需链组件�
 | `corokit::openssl` | OpenSSL/LibreSSL ≥ 1.1 |
 | `corokit::sqlite` | SQLite ≥ 3.37 |
 | `corokit::key_loader` | `corokit::openssl` |
-| `corokit::jwt` | `corokit::key_loader`、Boost::json |
+| `corokit::jwt` | `corokit::openssl`、`corokit::b64`（header-only）、Boost::json |
 | `corokit::http_srv` | Boost（asio/beast/json/url）、Threads |
-| `corokit::http_client` | `corokit::http_srv`、OpenSSL（上游 TLS） |
+| `corokit::http_client` | Boost::url（asio/beast 为 header-only）、OpenSSL（上游 TLS） |
 | `corokit::corokit` | 伞目标：全部选中组件 |
 
 **依赖解析是懒的**：只有至少一个选中组件需要某依赖时才会探测它——只引
@@ -151,6 +151,9 @@ s.close();                           // 幂等；解除硬顶并关上游（析�
 ### JWT 验签
 
 ```cpp
+#include "jwt.hpp"
+#include "key_loader.hpp"   // .NET XML 密钥加载：与 jwt 解耦，按需引入（链 corokit::key_loader）
+
 auto pub = loadPublicEvpKeyFromXml("public-key.xml");
 try {
     auto payload = verifyJwt(token, pub, "my-issuer", "my-audience");
